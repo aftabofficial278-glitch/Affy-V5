@@ -463,7 +463,11 @@ object AffyFastCommandRouter {
             lower.contains("samne kaun kaun se contact") || lower.contains("samne kaun se contact") ||
             lower.contains("kaun kaun se contact") || lower.contains("kaun se contact") ||
             lower.contains("visible chat") || lower.contains("chat list") || lower.contains("chats ke naam") ||
-            lower.contains("chats batao") || lower.contains("contacts batao") || lower.contains("chats dikhao")
+            lower.contains("chats batao") || lower.contains("contacts batao") || lower.contains("chats dikhao") ||
+            lower.contains("kitne contact") || lower.contains("itne contact") || lower.contains("contact ha unke name") ||
+            lower.contains("contact hain unke name") || lower.contains("contacts ke name") || lower.contains("contacts ke naam") ||
+            lower.contains("screen par kitne") || lower.contains("screen per kitne") || lower.contains("screen par kaun") ||
+            lower.contains("screen per kaun") || lower.contains("whatsapp par kitne") || lower.contains("whatsapp par kaun")
         ) {
             return AffyPlan(
                 intent = ActionTypes.READ_VISIBLE_CHATS,
@@ -476,7 +480,26 @@ object AffyFastCommandRouter {
             )
         }
 
-        // 8.0 Open Chat Message Reader ("jo chat screen par open hai uske messages padho", "is chat ke messages suna do", "is chat mein kya message aya hai")
+        // 8.001 Named Chat Opening ("Ali ki chat open karo", "Elon ki chat kholo", "chat khol do")
+        val namedChatOpenRegex = Regex("(?i)(?:screen\\s+par\\s+)?([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)\\s*(?:ki|ka)?\\s*chat\\s*(?:ko\\s+)?(?:open\\s*karo|open\\s*kar\\s*do|open\\s*kr\\s*do|open\\s*krdo|kholo|khol\\s*do|khol\\s*de|open)")
+        val namedChatMatch = namedChatOpenRegex.find(normalized.replace(Regex("(?i)^(?:affy|hey affy|suno affy)\\s*"), ""))
+        if (namedChatMatch != null) {
+            val targetChat = namedChatMatch.groupValues[1].trim()
+            if (targetChat.isNotBlank() && !targetChat.equals("open", ignoreCase = true) && !targetChat.equals("kholo", ignoreCase = true)) {
+                return AffyPlan(
+                    intent = ActionTypes.OPEN_CHAT,
+                    speechResponse = "'$targetChat' ki chat open kar raha hoon boss.",
+                    actions = listOf(
+                        AffyActionItem(
+                            type = ActionTypes.OPEN_CHAT,
+                            target = targetChat
+                        )
+                    )
+                )
+            }
+        }
+
+        // 8.0 Open Chat Message Reader ("jo chat screen par open hai uske messages padho", "is chat ke messages suna do", "is chat mein kya message aya hai", "unke msg read krna")
         if (lower.contains("chat screen par open") || lower.contains("chat open hai") || lower.contains("is chat ke messages") ||
             lower.contains("ye chat ke messages") || lower.contains("jo samne chat") || lower.contains("is chat ko padho") ||
             lower.contains("is chat ko parho") || lower.contains("ye chat parho") || lower.contains("ye chat padho") ||
@@ -487,7 +510,10 @@ object AffyFastCommandRouter {
             lower.contains("is chat mein kya message") || lower.contains("is chat me kya message") ||
             lower.contains("kya message aya hai") || lower.contains("kya message hai") ||
             lower.contains("message kya aya") || lower.contains("is chat mein kya likha") ||
-            lower.contains("is chat me kya likha") || lower.contains("chat mein kya aya")
+            lower.contains("is chat me kya likha") || lower.contains("chat mein kya aya") ||
+            lower.contains("msg read") || lower.contains("msg parh") || lower.contains("msg padh") ||
+            lower.contains("unke msg") || lower.contains("unke message") || lower.contains("messages read") ||
+            lower.contains("message read")
         ) {
             return AffyPlan(
                 intent = ActionTypes.READ_SCREEN_MESSAGES,
@@ -1073,7 +1099,7 @@ object AffyFastCommandRouter {
         val clean = speech.trim()
 
         // 0. WhatsApp Call Pattern: "[Contact] ko whatsapp call karo" or "whatsapp call [Contact]"
-        val waCallPattern1 = Regex("(?i)^([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)\\s+ko\\s+whatsapp\\s+(?:voice\\s+)?call\\s*(?:karo|lagao|milao|kar do|laga do|mila do)?$")
+        val waCallPattern1 = Regex("(?i)^([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)\\s+ko\\s+whatsapp\\s+(?:voice\\s+)?call\\s*(?:karo|lagao|milao|kar do|laga do|mila do|kr do|krdo|kr|kro|kar)?$")
         val waMatch1 = waCallPattern1.find(clean)
         if (waMatch1 != null) {
             val contact = waMatch1.groupValues[1].trim()
@@ -1091,7 +1117,7 @@ object AffyFastCommandRouter {
             }
         }
 
-        val waCallPattern2 = Regex("(?i)^whatsapp\\s+(?:voice\\s+)?call\\s*(?:karo|lagao|milao|kar do|laga do|mila do)?\\s*([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)(?:\\s+ko)?$")
+        val waCallPattern2 = Regex("(?i)^whatsapp\\s+(?:voice\\s+)?call\\s*(?:karo|lagao|milao|kar do|laga do|mila do|kr do|krdo|kr|kro|kar)?\\s*([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)(?:\\s+ko)?$")
         val waMatch2 = waCallPattern2.find(clean)
         if (waMatch2 != null) {
             val contact = waMatch2.groupValues[1].trim()
@@ -1109,8 +1135,8 @@ object AffyFastCommandRouter {
             }
         }
 
-        // Pattern 1: "[Contact] ko (call|phone) (karo|lagao|milao|kar do|laga do|mila do|karna|lagana)"
-        val p1 = Regex("(?i)^([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)\\s+ko\\s+(?:call|phone)\\s*(?:karo|lagao|milao|kar do|laga do|mila do|karna|lagana)?$")
+        // Pattern 1: "[Contact] ko (call|phone) (karo|lagao|milao|kar do|laga do|mila do|karna|lagana|kr|kro)"
+        val p1 = Regex("(?i)^([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)\\s+ko\\s+(?:call|phone)\\s*(?:karo|lagao|milao|kar do|laga do|mila do|karna|lagana|kr do|krdo|kr|kro|kar)?$")
         val m1 = p1.find(speech)
         if (m1 != null) {
             val contact = m1.groupValues[1].trim()
@@ -1129,7 +1155,7 @@ object AffyFastCommandRouter {
         }
 
         // Pattern 2: "(call|phone) (karo|lagao|milao) [Contact] (ko)?"
-        val p2 = Regex("(?i)^(?:call|phone)\\s+(?:karo|lagao|milao|kar do|laga do|mila do)?\\s*([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)(?:\\s+ko)?$")
+        val p2 = Regex("(?i)^(?:call|phone)\\s+(?:karo|lagao|milao|kar do|laga do|mila do|kr do|krdo|kr|kro|kar)?\\s*([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)(?:\\s+ko)?$")
         val m2 = p2.find(speech)
         if (m2 != null) {
             val contact = m2.groupValues[1].trim()

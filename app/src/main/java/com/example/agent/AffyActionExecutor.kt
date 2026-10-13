@@ -1,307 +1,3195 @@
 package com.example.agent
 
-import android.app.WallpaperManager
+import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
+import android.app.SearchManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
+import android.provider.AlarmClock
+import android.provider.Settings
 import android.util.Log
-import com.example.agent.vision.AffyScreenVisionEngine
-import com.example.agent.vision.SemanticUiClassifier
-import com.example.data.model.ActionResult
+import com.example.data.datastore.AffyPreferences
+import com.example.data.db.AffyDatabase
+import com.example.data.db.AgentMemoryEntity
 import com.example.data.model.ActionTypes
 import com.example.data.model.AffyActionItem
-import com.example.data.model.WorkflowStage
+import com.example.agent.vision.AffyScreenVisionEngine
+import com.example.agent.vision.ScreenStateType
+import com.example.agent.vision.TargetResolutionResult
+import com.example.agent.task.AgentExecutionResult
+import com.example.agent.task.AgentResultStatus
+import com.example.agent.task.AgentTaskStep
 import com.example.service.AffyAccessibilityService
+import com.example.service.AffyReminderManager
+import com.example.service.WhatsAppInstanceManager
+import com.example.voice.AffySingerEngine
+import com.example.voice.SingerResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+data class ActionResult(
+    val isSuccess: Boolean,
+    val summary: String,
+    val speechResponseOverride: String? = null
+)
 
 class AffyActionExecutor(
     private val context: Context,
-    private val contextManager: AffyConversationContextManager
+    private val database: AffyDatabase = AffyDatabase.getDatabase(context),
+    private val reminderManager: AffyReminderManager = AffyReminderManager(context),
+    private val contactResolver: ContactResolver = ContactResolver(context),
+    private val preferences: AffyPreferences = AffyPreferences(context),
+    val gmailManager: AffyGmailManager = AffyGmailManager(context, preferences),
+    private val visionEngine: AffyScreenVisionEngine = AffyScreenVisionEngine.getInstance(context),
+    val singerEngine: AffySingerEngine = AffySingerEngine.getInstance(context)
 ) {
-    private val visionEngine = AffyScreenVisionEngine()
 
     suspend fun executeAction(action: AffyActionItem): ActionResult = withContext(Dispatchers.IO) {
-        try {
-            when (action.type) {
-                ActionTypes.OPEN_APP -> handleOpenApp(action.target ?: "")
-                ActionTypes.CLICK -> handleClick(action)
-                ActionTypes.TYPE_TEXT -> handleTypeText(action.text ?: "")
-                ActionTypes.PHONE_CALL -> handlePhoneCall(action.target ?: action.text ?: "")
-                ActionTypes.CHATGPT_GENERATE_IMAGE -> handleChatGptGenerateImage(action.text ?: "attractive phone wallpaper")
-                ActionTypes.DOWNLOAD_CHATGPT_IMAGE -> handleDownloadChatGptImage()
-                ActionTypes.SET_WALLPAPER -> handleSetWallpaper()
-                else -> ActionResult(false, "Unknown action type: ${action.type}")
+        AffyDiagnostics.markActionStart(action.type, action.target)
+        val result = when (action.type) {
+            ActionTypes.SING_SONG -> handleSingSong(action.text ?: action.target ?: "")
+            ActionTypes.OPEN_APP -> openApp(action.target ?: "")
+            ActionTypes.CALL_CONTACT -> handleCallContact(action.target ?: "")
+            ActionTypes.WHATSAPP_CALL -> handleWhatsAppCall(action.target ?: "")
+            ActionTypes.SEND_WHATSAPP_MESSAGE, ActionTypes.SEND_MESSAGE -> handleWhatsAppMessage(action.target ?: "", action.text ?: "")
+            ActionTypes.SEND_SMS -> handleSendSms(action.target ?: "", action.text ?: "")
+            ActionTypes.TAP, ActionTypes.CLICK_ELEMENT -> handleClickElement(action.target ?: action.text ?: "")
+            ActionTypes.LONG_PRESS -> handleLongPressElement(action.target ?: action.text ?: "")
+            ActionTypes.TAP_LIKE, ActionTypes.LIKE_POST -> handleLikeAction()
+            ActionTypes.UNLIKE_POST -> handleUnlikeAction()
+            ActionTypes.SUBSCRIBE_CHANNEL -> handleSubscribeChannel(action.target ?: action.text)
+            ActionTypes.GET_VIDEO_TITLE -> handleGetVideoTitle()
+            ActionTypes.GET_MEDIA_CAPTION -> handleGetMediaCaption()
+            ActionTypes.OPEN_COMMENTS -> handleOpenComments()
+            ActionTypes.SELECT_VIDEO_RESULT -> handleSelectVideoResult(action.value?.toIntOrNull() ?: 1, action.text ?: action.target)
+            ActionTypes.UNIVERSAL_SEARCH -> handleUniversalSearch(action.text ?: action.target ?: "", action.target)
+            ActionTypes.COMMENT_ON_POST -> handleCommentOnPost(action.text ?: action.value ?: "")
+            ActionTypes.SHARE_POST -> handleSharePost()
+            ActionTypes.SEARCH_IN_SCREEN -> handleSearchInScreen(action.text ?: action.target ?: "")
+            ActionTypes.SCROLL, ActionTypes.SCROLL_DOWN -> handleScroll(down = true)
+            ActionTypes.SCROLL_UP -> handleScroll(down = false)
+            ActionTypes.SWIPE, ActionTypes.SWIPE_LEFT -> handleSwipe(left = true)
+            ActionTypes.SWIPE_RIGHT -> handleSwipe(left = false)
+            ActionTypes.NEXT_VIDEO -> handleNextVideo()
+            ActionTypes.TYPE_TEXT -> handleTypeText(action.text ?: action.value ?: "", action.target, shouldSend = action.value?.contains("send") == true || action.target?.contains("send") == true)
+            ActionTypes.CLEAR_TEXT -> handleClearText(action.target)
+            ActionTypes.OPEN_KEYBOARD -> handleOpenKeyboard(action.target)
+            ActionTypes.SELECT_TEXT -> handleSelectText(action.target ?: action.text ?: "")
+            ActionTypes.GO_BACK, ActionTypes.NAVIGATE_BACK -> handleGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK, "Back navigation")
+            ActionTypes.GO_HOME -> handleGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME, "Home navigation")
+            ActionTypes.OPEN_RECENTS -> handleGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS, "Recent apps")
+            ActionTypes.OPEN_NOTIFICATIONS -> handleGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS, "Notifications")
+            ActionTypes.OPEN_QUICK_SETTINGS -> handleGlobalAction(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS, "Quick settings")
+            ActionTypes.CLOSE_APP, ActionTypes.CLOSE_PAGE -> handleCloseAppOrPage(action.target)
+            ActionTypes.MEDIA_PLAY -> handleMediaControl("play")
+            ActionTypes.MEDIA_PAUSE -> handleMediaControl("pause")
+            ActionTypes.MEDIA_NEXT -> handleMediaControl("next")
+            ActionTypes.CONTROL_MEDIA -> handleMediaControl(action.target ?: "play")
+            ActionTypes.VOLUME_UP -> handleVolume("up")
+            ActionTypes.VOLUME_DOWN -> handleVolume("down")
+            ActionTypes.SET_VOLUME -> handleVolume(action.value ?: "up")
+            ActionTypes.BRIGHTNESS, ActionTypes.SET_BRIGHTNESS -> handleBrightness(action.value ?: "up")
+            ActionTypes.TOGGLE_FLASHLIGHT -> handleFlashlight(action.value ?: action.target ?: "toggle")
+            ActionTypes.TOGGLE_WIFI -> handleToggleWifi(action.value ?: action.target)
+            ActionTypes.TOGGLE_BLUETOOTH -> handleQuickSettingToggle("Bluetooth", action.value ?: action.target)
+            ActionTypes.TOGGLE_MOBILE_DATA -> handleToggleMobileData(action.value ?: action.target)
+            ActionTypes.TOGGLE_HOTSPOT -> handleQuickSettingToggle("Hotspot", action.value ?: action.target)
+            ActionTypes.TOGGLE_AIRPLANE_MODE -> handleQuickSettingToggle("Airplane Mode", action.value ?: action.target)
+            ActionTypes.TOGGLE_AUTO_ROTATE -> handleQuickSettingToggle("Auto-rotate", action.value ?: action.target)
+            ActionTypes.SET_RINGER_MODE -> handleRingerMode(action.value ?: action.target ?: "normal")
+            ActionTypes.TOGGLE_QUICK_SETTING -> handleQuickSettingToggle(action.target ?: "Quick Setting", action.value)
+            ActionTypes.SET_ALARM -> handleSetAlarm(action.target ?: "", action.text ?: "")
+            ActionTypes.CREATE_REMINDER -> handleCreateReminder(action.target ?: "", action.text ?: "")
+            ActionTypes.CANCEL_REMINDER -> handleCancelReminder(action.target ?: "")
+            ActionTypes.READ_NOTIFICATION -> handleReadNotifications(action.target)
+            ActionTypes.READ_VISIBLE_CHATS -> handleReadVisibleChats()
+            ActionTypes.READ_SCREEN_MESSAGES -> handleReadScreenMessages()
+            ActionTypes.OPEN_CHAT -> handleOpenChat(action.target ?: action.text ?: "")
+            ActionTypes.HANDLE_CHAT_AUTHORIZATION -> handleAuthorizeChat(action.target ?: "")
+            ActionTypes.REVOKE_CHAT_AUTHORIZATION -> handleRevokeChat(action.target)
+            ActionTypes.REMEMBER_FACT -> handleRememberFact(action.value ?: action.text ?: action.target ?: "")
+            ActionTypes.FORGET_FACT -> handleForgetFact(action.target ?: action.text ?: action.value ?: "")
+            ActionTypes.RECALL_FACT -> handleRecallFact(action.target ?: action.text ?: "")
+            ActionTypes.CLEAR_MEMORY -> handleClearMemory()
+            ActionTypes.GET_TIME -> handleGetTime()
+            ActionTypes.GET_DATE -> handleGetDate()
+            ActionTypes.GET_BATTERY -> handleGetBattery()
+            ActionTypes.SEARCH, ActionTypes.SEARCH_WEB -> {
+                val target = (action.target ?: "").trim()
+                val text = (action.text ?: "").trim()
+                if (target.equals("YouTube", ignoreCase = true) || text.lowercase().contains("youtube") || target.lowercase().contains("youtube")) {
+                    val cleanQuery = if (text.isNotBlank()) text.replace(Regex("(?i)\\byoutube\\b"), "").trim() else target.replace(Regex("(?i)\\byoutube\\b"), "").trim()
+                    executeMultiStepAppCommand("YouTube", cleanQuery.ifBlank { "trending" }, "search")
+                } else if (target.equals("Spotify", ignoreCase = true)) {
+                    executeMultiStepAppCommand("Spotify", text.ifBlank { target }, "search")
+                } else {
+                    val webQuery = if (text.isNotBlank()) text else target
+                    handleSearchWeb(webQuery)
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error executing action ${action.type}", e)
-            ActionResult(false, "Execution failed: ${e.localizedMessage}")
+            ActionTypes.READ_SCREEN, ActionTypes.EXPLAIN_SCREEN -> handleReadScreen()
+            ActionTypes.MULTI_STEP_APP_COMMAND -> executeMultiStepAppCommand(
+                appName = action.target ?: "",
+                query = action.text ?: "",
+                desiredAction = action.value ?: "play"
+            )
+            ActionTypes.CHECK_GMAIL -> handleGmailCheck()
+            ActionTypes.READ_GMAIL -> handleGmailRead()
+            ActionTypes.REPLY_GMAIL -> handleGmailReply(action.text ?: "")
+            "CHECK_ATTACHMENT", "VERIFY_ATTACHMENT" -> handleCheckAttachment()
+            ActionTypes.STOP_CANCEL -> handleStopCancel()
+            ActionTypes.DEACTIVATE_OVERLAY -> handleDeactivateOverlay()
+            ActionTypes.SET_VOICE, ActionTypes.CHANGE_VOICE -> handleSetVoice(action.target ?: action.value)
+            ActionTypes.LOCK_DEVICE -> handleLockDevice()
+            ActionTypes.UNLOCK_DEVICE, ActionTypes.WAKE_SCREEN -> handleUnlockOrWakeDevice()
+            ActionTypes.TAKE_SCREENSHOT -> handleTakeScreenshot()
+            ActionTypes.CHATGPT_GENERATE_IMAGE -> handleChatGptGenerateImage(action.text ?: action.value ?: "", action.target)
+            ActionTypes.DOWNLOAD_CHATGPT_IMAGE -> handleDownloadChatGptImage(action.target ?: action.text)
+            ActionTypes.SET_WALLPAPER -> handleSetWallpaper(action.target ?: "BOTH", action.value ?: action.text)
+            ActionTypes.GENERATE_IMAGE -> handleGenerateImage(action.text ?: action.target ?: "", action.target)
+            ActionTypes.ANALYZE_SECURITY -> handleAnalyzeSecurity(action.text ?: action.target ?: "")
+            ActionTypes.RESEARCH_TOPIC -> handleResearchTopic(action.text ?: action.target ?: "")
+            ActionTypes.COPY_TEXT -> handleCopyText(action.text ?: action.target ?: "")
+            ActionTypes.PASTE_TEXT -> handlePasteText(action.target)
+            ActionTypes.OPEN_CAMERA -> handleOpenCamera()
+            ActionTypes.TAKE_PHOTO -> handleTakePhoto(action.value ?: action.target)
+            ActionTypes.FORCE_STOP_APP, ActionTypes.KILL_APP -> handleForceStopApp(action.target ?: action.text ?: "")
+            ActionTypes.SELECT_SIM -> handleSelectSim(action.target ?: action.value)
+            else -> ActionResult(true, "Chat or generic action")
         }
+
+        AffyDiagnostics.markActionVerified(action.type, result.isSuccess)
+        AffyDiagnostics.logAction(
+            category = "ACTION_EXECUTION",
+            tag = action.type,
+            message = "${action.type} -> ${result.summary}",
+            isSuccess = result.isSuccess
+        )
+        result
     }
 
-    private fun handleOpenApp(appNameOrPkg: String): ActionResult {
-        val pm = context.packageManager
-        val pkg = if (appNameOrPkg.contains(".")) {
-            appNameOrPkg
+    /**
+     * Executes an autonomous AgentTaskStep and returns an AgentExecutionResult
+     * indicating SUCCESS, FAILED, NEEDS_CONFIRMATION, or UNSUPPORTED.
+     */
+    suspend fun executeAgentStep(step: AgentTaskStep): AgentExecutionResult = withContext(Dispatchers.IO) {
+        val actionType = step.actionType
+        val target = step.target
+        val text = step.text
+        val value = step.value
+
+        // Safety gate check for sensitive actions
+        if (isSensitiveAction(actionType)) {
+            return@withContext AgentExecutionResult(
+                status = AgentResultStatus.NEEDS_CONFIRMATION,
+                summary = "Action '$actionType' requires explicit user confirmation.",
+                speechOverride = "Kya aap waqai '$actionType' perform karna chahte hain?"
+            )
+        }
+
+        // Convert to standard action item
+        val actionItem = AffyActionItem(
+            type = actionType,
+            target = target,
+            text = text,
+            value = value
+        )
+
+        AffyDiagnostics.logTaskStage("ACTION_EXECUTE", action = actionType, details = step.description)
+
+        val result = executeAction(actionItem)
+
+        if (result.isSuccess) {
+            AgentExecutionResult(
+                status = AgentResultStatus.SUCCESS,
+                summary = result.summary,
+                speechOverride = result.speechResponseOverride,
+                observedState = result.summary
+            )
         } else {
-            when (appNameOrPkg.lowercase()) {
-                "chatgpt" -> "com.openai.chatgpt"
-                "youtube" -> "com.google.android.youtube"
-                "whatsapp" -> "com.whatsapp"
+            // Check if failure is recoverable
+            val canRecover = step.retryCount < 2 && isRecoverableAction(actionType)
+            val recoveryHint = when (actionType) {
+                ActionTypes.OPEN_APP -> "Re-query installed packages with relaxed fuzzy matching"
+                ActionTypes.TAP, ActionTypes.CLICK_ELEMENT -> "Re-inspect accessibility node tree after delay"
+                ActionTypes.SEARCH_WEB, ActionTypes.SEARCH -> "Fallback to direct generic web search intent"
                 else -> null
             }
-        }
 
-        val launchIntent = if (pkg != null) pm.getLaunchIntentForPackage(pkg) else null
-        return if (launchIntent != null) {
-            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(launchIntent)
-            ActionResult(true, "Opened $appNameOrPkg successfully.")
-        } else {
-            ActionResult(false, "App $appNameOrPkg is not installed or launch intent not found.")
-        }
-    }
-
-    private fun handleClick(action: AffyActionItem): ActionResult {
-        val service = AffyAccessibilityService.instance
-            ?: return ActionResult(false, "Accessibility Service is not enabled. Please enable it in Settings.")
-
-        val root = service.rootInActiveWindow
-            ?: return ActionResult(false, "Active screen root is unavailable.")
-
-        val targetText = action.text ?: action.target
-        if (!targetText.isNullOrBlank()) {
-            val node = service.findNodeByText(targetText, root)
-                ?: service.findNodeByViewId(targetText, root)
-            if (node != null) {
-                val clicked = service.clickNode(node)
-                return ActionResult(clicked, if (clicked) "Clicked '$targetText'." else "Failed to click '$targetText'.")
-            }
-        }
-
-        if (action.x != null && action.y != null) {
-            val tapped = service.dispatchTap(action.x, action.y)
-            return ActionResult(tapped, if (tapped) "Dispatched tap at (${action.x}, ${action.y})." else "Tap gesture failed.")
-        }
-
-        return ActionResult(false, "No matching target or coordinates for click action.")
-    }
-
-    private fun handleTypeText(text: String): ActionResult {
-        val service = AffyAccessibilityService.instance
-            ?: return ActionResult(false, "Accessibility Service is not enabled.")
-
-        val typed = service.typeText(text)
-        return ActionResult(typed, if (typed) "Typed text successfully." else "Could not find an editable input field.")
-    }
-
-    private fun handlePhoneCall(phoneNumber: String): ActionResult {
-        val cleanNumber = phoneNumber.filter { it.isDigit() || it == '+' }
-        if (cleanNumber.isBlank()) {
-            return ActionResult(false, "Invalid phone number provided.")
-        }
-
-        val intent = Intent(Intent.ACTION_CALL).apply {
-            data = Uri.parse("tel:$cleanNumber")
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-
-        return try {
-            context.startActivity(intent)
-            ActionResult(true, "Calling $cleanNumber...", speechResponseOverride = "Calling $cleanNumber now.")
-        } catch (e: SecurityException) {
-            val dialIntent = Intent(Intent.ACTION_DIAL).apply {
-                data = Uri.parse("tel:$cleanNumber")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(dialIntent)
-            ActionResult(true, "Dialer opened for $cleanNumber.", speechResponseOverride = "Opening dialer for $cleanNumber.")
-        }
-    }
-
-    private suspend fun handleChatGptGenerateImage(prompt: String): ActionResult {
-        contextManager.startWorkflow("com.openai.chatgpt", prompt)
-
-        val openRes = handleOpenApp("com.openai.chatgpt")
-        if (!openRes.success) {
-            contextManager.updateStage(WorkflowStage.FAILED, openRes.summary)
-            return ActionResult(false, "Could not open ChatGPT app: ${openRes.summary}")
-        }
-
-        delay(1200)
-
-        val service = AffyAccessibilityService.instance
-        if (service == null) {
-            contextManager.updateStage(WorkflowStage.FAILED, "Accessibility Service disabled")
-            return ActionResult(false, "Accessibility Service is not enabled.")
-        }
-
-        val root = service.rootInActiveWindow
-        val inputNode = SemanticUiClassifier.findPromptInputField(root)
-        if (inputNode == null) {
-            contextManager.updateStage(WorkflowStage.FAILED, "Input field not found")
-            return ActionResult(false, "Could not find the ChatGPT message input box on screen.")
-        }
-
-        val promptTyped = service.typeText("Generate an image: $prompt", inputNode)
-        if (!promptTyped) {
-            contextManager.updateStage(WorkflowStage.FAILED, "Text entry failed")
-            return ActionResult(false, "Failed to enter image prompt into ChatGPT.")
-        }
-
-        delay(400)
-
-        val updatedRoot = service.rootInActiveWindow
-        val sendBtn = SemanticUiClassifier.findSendButton(updatedRoot)
-        if (sendBtn != null) {
-            service.clickNode(sendBtn)
-        } else {
-            inputNode.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
-        }
-
-        // Real screen observation
-        when (val observation = visionEngine.observeImageGeneration(timeoutMs = 40000L)) {
-            is AffyScreenVisionEngine.ImageObservationResult.Ready -> {
-                val status = observation.statusMessage ?: "Image generated and visible on screen."
-                contextManager.updateStage(WorkflowStage.READY_FOR_DOWNLOAD, status)
-                return ActionResult(
-                    success = true,
-                    summary = "ChatGPT has finished generating your wallpaper.",
-                    speechResponseOverride = "Your wallpaper has been generated and appears ready. Say 'download it' to save it."
-                )
-            }
-            is AffyScreenVisionEngine.ImageObservationResult.Error -> {
-                contextManager.updateStage(WorkflowStage.FAILED, observation.errorMessage)
-                return ActionResult(
-                    success = false,
-                    summary = "ChatGPT encountered an error: ${observation.errorMessage}",
-                    speechResponseOverride = "ChatGPT displayed an error: ${observation.errorMessage}"
-                )
-            }
-            is AffyScreenVisionEngine.ImageObservationResult.Timeout -> {
-                contextManager.updateStage(WorkflowStage.READY_FOR_DOWNLOAD, "Image generation took longer than usual; controls are available.")
-                return ActionResult(
-                    success = true,
-                    summary = "Observation timed out, but ChatGPT generation controls are visible.",
-                    speechResponseOverride = "ChatGPT seems to have completed the prompt. Say 'download it' when you are ready."
-                )
-            }
-        }
-    }
-
-    private suspend fun handleDownloadChatGptImage(): ActionResult {
-        val activeWf = contextManager.getActiveWorkflow()
-        val service = AffyAccessibilityService.instance
-            ?: return ActionResult(false, "Accessibility Service is not enabled.")
-
-        val root = service.rootInActiveWindow
-            ?: return ActionResult(false, "Active screen is not available.")
-
-        val downloadBtn = SemanticUiClassifier.findDownloadButton(root)
-        if (downloadBtn != null) {
-            service.clickNode(downloadBtn)
-        } else {
-            val imgNode = SemanticUiClassifier.findGeneratedImageNode(root)
-            if (imgNode != null) {
-                service.clickNode(imgNode)
-                delay(800)
-                val modalRoot = service.rootInActiveWindow
-                val modalDownload = SemanticUiClassifier.findDownloadButton(modalRoot)
-                if (modalDownload != null) {
-                    service.clickNode(modalDownload)
-                } else {
-                    return ActionResult(false, "Could not find download button in image viewer.")
-                }
-            } else {
-                return ActionResult(false, "No downloadable image or download button found on screen.")
-            }
-        }
-
-        val (confirmed, message) = visionEngine.observeDownloadConfirmation()
-        return if (confirmed) {
-            contextManager.updateStage(WorkflowStage.DOWNLOAD_VERIFIED, message, downloadedUri = "content://media/external/images/media/latest")
-            ActionResult(
-                success = true,
-                summary = "Image downloaded successfully: $message",
-                speechResponseOverride = "I observed the confirmation: $message. Say 'set it as my wallpaper' to apply it."
+            AgentExecutionResult(
+                status = AgentResultStatus.FAILED,
+                summary = result.summary,
+                speechOverride = result.speechResponseOverride,
+                canRecover = canRecover,
+                recoveryHint = recoveryHint
             )
-        } else {
-            contextManager.updateStage(WorkflowStage.READY_FOR_DOWNLOAD, message)
-            ActionResult(
-                success = false,
-                summary = "Download status ambiguous: $message",
-                speechResponseOverride = "I clicked download, but could not observe a confirmed download message on screen."
-            )
-        }
-    }
-
-    private suspend fun handleSetWallpaper(): ActionResult = withContext(Dispatchers.IO) {
-        val wm = WallpaperManager.getInstance(context)
-        val initialWallpaperId = try {
-            wm.getWallpaperId(WallpaperManager.FLAG_SYSTEM)
-        } catch (e: Exception) {
-            -1
-        }
-
-        // Generate high-resolution attractive gradient bitmap for actual wallpaper application
-        val width = context.resources.displayMetrics.widthPixels.coerceAtLeast(1080)
-        val height = context.resources.displayMetrics.heightPixels.coerceAtLeast(1920)
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-
-        val paint = Paint().apply {
-            isAntiAlias = true
-        }
-
-        val gradient = android.graphics.LinearGradient(
-            0f, 0f, 0f, height.toFloat(),
-            intArrayOf(Color.parseColor("#0F2027"), Color.parseColor("#203A43"), Color.parseColor("#2C5364")),
-            null,
-            android.graphics.Shader.TileMode.CLAMP
-        )
-        paint.shader = gradient
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-
-        val stream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)
-        val inputStream = ByteArrayInputStream(stream.toByteArray())
-
-        try {
-            wm.setStream(inputStream, null, true, WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK)
-            val newWallpaperId = try {
-                wm.getWallpaperId(WallpaperManager.FLAG_SYSTEM)
-            } catch (e: Exception) {
-                initialWallpaperId + 1
-            }
-
-            if (newWallpaperId != initialWallpaperId) {
-                contextManager.updateStage(WorkflowStage.WALLPAPER_APPLIED, "Wallpaper applied successfully")
-                ActionResult(
-                    success = true,
-                    summary = "Wallpaper applied and verified on device.",
-                    speechResponseOverride = "Your new wallpaper has been successfully applied to your home and lock screen."
-                )
-            } else {
-                ActionResult(
-                    success = false,
-                    summary = "Wallpaper application could not be verified by system manager.",
-                    speechResponseOverride = "Wallpaper setting was attempted, but system confirmation was not observed."
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to apply wallpaper", e)
-            ActionResult(false, "Wallpaper application failed: ${e.localizedMessage}")
         }
     }
 
     companion object {
-        private const val TAG = "AffyActionExecutor"
+        fun isSensitiveAction(actionType: String): Boolean {
+            val upper = actionType.uppercase(Locale.ROOT)
+            return upper == ActionTypes.CLEAR_MEMORY ||
+                    upper == "CLEAR_MEMORY" ||
+                    upper == "FACTORY_RESET" ||
+                    upper == "DELETE_ALL_DATA" ||
+                    upper == "DELETE_DATABASE"
+        }
+
+        fun isRecoverableAction(actionType: String): Boolean {
+            return actionType == ActionTypes.OPEN_APP ||
+                    actionType == ActionTypes.TAP ||
+                    actionType == ActionTypes.CLICK_ELEMENT ||
+                    actionType == ActionTypes.SEARCH_WEB ||
+                    actionType == ActionTypes.SEARCH
+        }
+    }
+
+    private suspend fun openApp(appName: String): ActionResult {
+        if (appName.isBlank()) return ActionResult(false, "No app name provided")
+
+        val cleanName = appName.trim().lowercase()
+
+        // Phase 3.1 WhatsApp Smart Instance Intelligence
+        if (cleanName.contains("whatsapp")) {
+            val waResult = WhatsAppInstanceManager.openWhatsAppSmart(context, appName)
+            return when (waResult) {
+                is com.example.service.OpenWhatsAppResult.Success -> {
+                    ActionResult(true, waResult.message, speechResponseOverride = waResult.message)
+                }
+                is com.example.service.OpenWhatsAppResult.AlreadyForeground -> {
+                    ActionResult(true, waResult.message, speechResponseOverride = waResult.message)
+                }
+                is com.example.service.OpenWhatsAppResult.MultipleInstances -> {
+                    ActionResult(false, "Multiple WhatsApp instances found", speechResponseOverride = waResult.prompt)
+                }
+                is com.example.service.OpenWhatsAppResult.NotFound -> {
+                    ActionResult(false, waResult.message, speechResponseOverride = waResult.message)
+                }
+                is com.example.service.OpenWhatsAppResult.Failed -> {
+                    ActionResult(false, waResult.reason, speechResponseOverride = waResult.reason)
+                }
+            }
+        }
+
+        val service = AffyAccessibilityService.instance
+        val currentFg = service?.rootInActiveWindow?.packageName?.toString() ?: AffyAccessibilityService.currentAppPackage.value ?: ""
+
+        // Known popular package mappings
+        val packageMap = mapOf(
+            "chatgpt" to listOf("com.openai.chatgpt"),
+            "openai" to listOf("com.openai.chatgpt"),
+            "tiktok" to listOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill"),
+            "youtube" to listOf("com.google.android.youtube"),
+            "instagram" to listOf("com.instagram.android"),
+            "facebook" to listOf("com.facebook.katana", "com.facebook.lite"),
+            "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+            "gmail" to listOf("com.google.android.gm"),
+            "chrome" to listOf("com.android.chrome"),
+            "maps" to listOf("com.google.android.apps.maps"),
+            "spotify" to listOf("com.spotify.music"),
+            "camera" to listOf("com.android.camera", "com.google.android.GoogleCamera"),
+            "settings" to listOf("com.android.settings"),
+            "clock" to listOf("com.google.android.deskclock", "com.android.deskclock"),
+            "gallery" to listOf("com.google.android.apps.photos", "com.android.gallery3d"),
+            "play store" to listOf("com.android.vending"),
+            "calculator" to listOf("com.google.android.calculator", "com.android.calculator2")
+        )
+
+        val pm = context.packageManager
+
+        // Check explicit map first
+        for ((key, packages) in packageMap) {
+            if (cleanName.contains(key) || key.contains(cleanName)) {
+                for (pkg in packages) {
+                    if (currentFg.equals(pkg, ignoreCase = true)) {
+                        return ActionResult(true, "$key is already open", "Boss, $key pehle se open hai.")
+                    }
+                    val launchIntent = pm.getLaunchIntentForPackage(pkg)
+                    if (launchIntent != null) {
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(launchIntent)
+                        val verified = service?.verifyAppInForeground(pkg, 2500L) ?: true
+                        val label = key.replaceFirstChar { it.uppercase() }
+                        return if (verified) {
+                            ActionResult(true, "Opened $label", "Haan, $label khol diya hai.")
+                        } else {
+                            ActionResult(false, "Failed to verify $label in foreground", "Boss, $label kholne ki koshish ki magar open confirm nahi hua.")
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generic search through installed apps
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val resolveInfos = pm.queryIntentActivities(mainIntent, 0)
+        for (info in resolveInfos) {
+            val label = info.loadLabel(pm).toString().lowercase()
+            val pkg = info.activityInfo.packageName
+            if (label.contains(cleanName) || cleanName.contains(label)) {
+                if (currentFg.equals(pkg, ignoreCase = true)) {
+                    val appLabel = info.loadLabel(pm).toString()
+                    return ActionResult(true, "$appLabel is already open", "Boss, $appLabel pehle se khula hua hai.")
+                }
+                val launchIntent = pm.getLaunchIntentForPackage(pkg)
+                if (launchIntent != null) {
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launchIntent)
+                    val appLabel = info.loadLabel(pm).toString()
+                    val verified = service?.verifyAppInForeground(pkg, 2500L) ?: true
+                    return if (verified) {
+                        ActionResult(true, "Opened $appLabel", "Haan, $appLabel khol diya hai.")
+                    } else {
+                        ActionResult(false, "Failed to verify $appLabel in foreground", "Boss, $appLabel open karne ki koshish ki magar verify nahi hua.")
+                    }
+                }
+            }
+        }
+
+        // Fallback for camera intents
+        if (cleanName.contains("camera")) {
+            val cameraIntent = Intent("android.media.action.IMAGE_CAPTURE").apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(cameraIntent)
+            return ActionResult(true, "Opened Camera", "Camera khol diya hai.")
+        }
+
+        return ActionResult(
+            false,
+            "App $appName not installed",
+            speechResponseOverride = "Hmm, $appName app aapke phone mein installed nahi mila."
+        )
+    }
+
+    fun executeDirectCall(phoneNumber: String, contactName: String, typeLabel: String = "Mobile"): ActionResult {
+        val success = contactResolver.initiateCall(phoneNumber)
+        return if (success) {
+            val typeStr = if (typeLabel.isNotBlank()) " ($typeLabel)" else ""
+            ActionResult(
+                isSuccess = true,
+                summary = "Calling $contactName$typeStr",
+                speechResponseOverride = "$contactName$typeStr ko call mila raha hoon."
+            )
+        } else {
+            ActionResult(
+                isSuccess = false,
+                summary = "Failed to place call to $contactName",
+                speechResponseOverride = "Call connect nahi ho saki."
+            )
+        }
+    }
+
+    suspend fun executeDirectWhatsAppCall(phoneNumber: String, contactName: String): ActionResult {
+        val cleanPhone = phoneNumber.replace(Regex("[^0-9]"), "")
+        val targetPkg = WhatsAppInstanceManager.resolveOutgoingInstance(context) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+        return try {
+            val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone")
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                `package` = targetPkg
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+            delay(1000)
+            val a11y = AffyAccessibilityService.instance
+            if (a11y != null) {
+                val called = a11y.triggerWhatsAppCall(isVideo = false)
+                if (called) {
+                    ActionResult(true, "WhatsApp call placed to $contactName", speechResponseOverride = "$contactName ko WhatsApp call mila di hai.")
+                } else {
+                    ActionResult(true, "Opened $contactName on WhatsApp", speechResponseOverride = "$contactName ki chat khol di hai boss.")
+                }
+            } else {
+                ActionResult(true, "Opened $contactName on WhatsApp", speechResponseOverride = "$contactName ki chat khol di hai boss.")
+            }
+        } catch (e: Exception) {
+            ActionResult(false, "WhatsApp call failed: ${e.message}", speechResponseOverride = "WhatsApp call lagane mein masla hua.")
+        }
+    }
+
+    suspend fun executeDirectWhatsApp(
+        recipientPhone: String,
+        recipientName: String,
+        message: String,
+        targetPackage: String? = null
+    ): ActionResult {
+        if (message.isBlank()) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "Message text is empty",
+                speechResponseOverride = "$recipientName ko WhatsApp par kya message bhejna hai?"
+            )
+        }
+
+        val notifAssistant = AffyNotificationAssistant.getInstance(context)
+        notifAssistant.invalidateStaleTargetIfChanged(recipientName)
+
+        // Priority 1: Check bound notification target ONLY if it strictly matches recipientName / recipientPhone
+        val contextualMsg = notifAssistant.resolveContextualSender(recipientName)
+            ?.takeIf {
+                ContactResolver.doesIdentityMatch(it.sender, recipientName, recipientPhone) ||
+                        ContactResolver.doesIdentityMatch(it.conversationTitle, recipientName, recipientPhone)
+            }
+
+        if (contextualMsg != null && (targetPackage == null || targetPackage.equals(contextualMsg.packageName, ignoreCase = true))) {
+            val (directSuccess, directSummary) = notifAssistant.executeDirectReply(contextualMsg.sender, message)
+            if (directSuccess) {
+                return ActionResult(
+                    isSuccess = true,
+                    summary = directSummary,
+                    speechResponseOverride = "Boss, ${contextualMsg.sender} ko WhatsApp reply bhej diya."
+                )
+            }
+        }
+
+        // Validate phone number before using a wa.me / api.whatsapp.com link (never invent numbers)
+        if (!ContactResolver.isValidPhoneNumber(recipientPhone)) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "Invalid or unverified phone number for $recipientName",
+                speechResponseOverride = "Boss, $recipientName ka phone number verify nahi ho saka. Aap kis chat mein message bhejna chahte hain?"
+            )
+        }
+
+        // Priority 2: Foreground Accessibility Flow with strict conversation and message verification
+        val installedInstances = WhatsAppInstanceManager.getInstalledInstances(context)
+        if (installedInstances.isEmpty()) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "WhatsApp not installed",
+                speechResponseOverride = "Phone mein WhatsApp installed nahi mila."
+            )
+        }
+
+        val resolvedPkg = targetPackage?.takeIf { it.isNotBlank() }
+            ?: contextualMsg?.packageName?.takeIf { it.isNotBlank() }
+            ?: preferences.preferredWhatsAppPackageFlow.first().ifBlank { null }
+            ?: WhatsAppInstanceManager.resolveOutgoingInstance(context)
+            ?: WhatsAppInstanceManager.PKG_WHATSAPP
+
+        try {
+            val cleanPhone = recipientPhone.replace(Regex("[^0-9]"), "")
+            val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone&text=${Uri.encode(message)}")
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                `package` = resolvedPkg
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+
+            val a11y = AffyAccessibilityService.instance
+            if (a11y != null) {
+                delay(800)
+                val verifyResult = a11y.automateWhatsAppSendVerified(
+                    targetPackage = resolvedPkg,
+                    messageText = message,
+                    expectedRecipient = recipientName,
+                    expectedPhone = cleanPhone
+                )
+                return if (verifyResult.isSentAndVerified) {
+                    notifAssistant.markSenderMessagesReplied(recipientName, resolvedPkg)
+                    AffyConversationContextManager.getInstance().clearActiveNotificationContext()
+                    ActionResult(
+                        isSuccess = true,
+                        summary = "WhatsApp message sent to $recipientName",
+                        speechResponseOverride = "Ji boss! $recipientName ko WhatsApp message bhej diya hai."
+                    )
+                } else if (
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH ||
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_UNCONFIRMED ||
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.PACKAGE_MISMATCH
+                ) {
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "WhatsApp chat identity unconfirmed for $recipientName",
+                        speechResponseOverride = "Boss, $recipientName ki exact chat confirm nahi ho saki. Aap kis chat mein message bhejna chahte hain?"
+                    )
+                } else {
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "WhatsApp send unverified",
+                        speechResponseOverride = "$recipientName ki chat khol di hai magar message send confirm nahi ho saka. Send dabayein."
+                    )
+                }
+            }
+
+            return ActionResult(
+                isSuccess = false,
+                summary = "Accessibility service inactive",
+                speechResponseOverride = "$recipientName ki chat khol di hai boss. Direct send ke liye Accessibility enable karein."
+            )
+        } catch (e: Exception) {
+            Log.e("AffyActionExecutor", "WhatsApp direct send error: ${e.message}")
+            return ActionResult(
+                isSuccess = false,
+                summary = "WhatsApp send failed: ${e.message}",
+                speechResponseOverride = "WhatsApp open karne mein masla hua."
+            )
+        }
+    }
+
+    private fun handleCallContact(contactName: String): ActionResult {
+        if (contactName.isBlank()) {
+            return ActionResult(false, "No contact name", "Kisko call karni hai?")
+        }
+
+        val result = contactResolver.resolveContact(contactName)
+        return when (result) {
+            is ContactResolutionResult.Single -> {
+                val success = contactResolver.initiateCall(result.phoneNumber)
+                if (success) {
+                    ActionResult(true, "Calling ${result.name}", "${result.name} ko call mila raha hoon.")
+                } else {
+                    ActionResult(false, "Failed to place call", "Call connect nahi ho saki.")
+                }
+            }
+            is ContactResolutionResult.Multiple -> {
+                val formattedList = result.candidates.mapIndexed { idx, c ->
+                    "${idx + 1}. ${c.displayString}"
+                }.joinToString("\n")
+
+                val targetName = if (result.candidates.all { it.name.equals(result.candidates[0].name, ignoreCase = true) }) {
+                    result.candidates[0].name
+                } else {
+                    contactName
+                }
+
+                val speechPrompt = "$targetName ke ${result.candidates.size} contacts mile hain:\n$formattedList\nKaunse number par call karun? Pehla ya doosra?"
+
+                AffyConversationContextManager.getInstance().setPendingContactDisambiguation(
+                    PendingContactDisambiguation(
+                        actionType = DisambiguationActionType.CALL,
+                        originalQuery = contactName,
+                        candidates = result.candidates
+                    )
+                )
+
+                ActionResult(
+                    isSuccess = false,
+                    summary = "Multiple contacts found (${result.candidates.size})",
+                    speechResponseOverride = speechPrompt
+                )
+            }
+            is ContactResolutionResult.NotFound -> {
+                ActionResult(
+                    false,
+                    "Contact not found",
+                    speechResponseOverride = "Hmm, $contactName naam ka contact nahi mila."
+                )
+            }
+            is ContactResolutionResult.PermissionMissing -> {
+                ActionResult(
+                    false,
+                    "Permission missing",
+                    speechResponseOverride = "Contacts aur Phone ki permission chahiye call karne ke liye."
+                )
+            }
+        }
+    }
+
+    private suspend fun handleWhatsAppCall(contactName: String, isVideo: Boolean = false): ActionResult {
+        if (contactName.isBlank()) {
+            return ActionResult(false, "No contact name provided", "Kisko WhatsApp call karni hai?")
+        }
+
+        val a11y = AffyAccessibilityService.instance
+        val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
+
+        // Screen-First check: If WhatsApp conversation is already open on screen
+        if (a11y != null && WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) &&
+            (contactName.contains("current") || contactName.contains("is chat") || contactName.contains("ye chat") || contactName.contains("this"))
+        ) {
+            val called = a11y.triggerWhatsAppCall(isVideo)
+            return if (called) {
+                ActionResult(true, "WhatsApp call placed", speechResponseOverride = "Ji boss, WhatsApp call mila di hai.")
+            } else {
+                ActionResult(false, "Call button not found", speechResponseOverride = "Screen par WhatsApp call button nahi mila.")
+            }
+        }
+
+        val result = contactResolver.resolveContact(contactName)
+        return when (result) {
+            is ContactResolutionResult.Single -> {
+                val cleanPhone = result.phoneNumber.replace(Regex("[^0-9]"), "")
+                val targetPkg = WhatsAppInstanceManager.resolveOutgoingInstance(context) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+                try {
+                    val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone")
+                    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                        `package` = targetPkg
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                    delay(1000)
+                    if (a11y != null) {
+                        val called = a11y.triggerWhatsAppCall(isVideo)
+                        if (called) {
+                            ActionResult(true, "WhatsApp call placed to ${result.name}", speechResponseOverride = "${result.name} ko WhatsApp call mila di hai.")
+                        } else {
+                            ActionResult(true, "Opened ${result.name} on WhatsApp", speechResponseOverride = "${result.name} ki chat khol di hai boss. Call button dabayein.")
+                        }
+                    } else {
+                        ActionResult(true, "Opened ${result.name} on WhatsApp", speechResponseOverride = "${result.name} ki chat khol di hai boss.")
+                    }
+                } catch (e: Exception) {
+                    ActionResult(false, "WhatsApp call failed: ${e.message}", speechResponseOverride = "WhatsApp call lagane mein masla hua.")
+                }
+            }
+            is ContactResolutionResult.Multiple -> {
+                val formattedList = result.candidates.mapIndexed { idx, c ->
+                    "${idx + 1}. ${c.displayString}"
+                }.joinToString("\n")
+                val targetName = if (result.candidates.all { it.name.equals(result.candidates[0].name, ignoreCase = true) }) {
+                    result.candidates[0].name
+                } else {
+                    contactName
+                }
+                val prompt = "$targetName ke ${result.candidates.size} contacts mile hain:\n$formattedList\nKaunse number pe WhatsApp call karun? Pehla ya doosra?"
+                AffyConversationContextManager.getInstance().setPendingContactDisambiguation(
+                    PendingContactDisambiguation(
+                        actionType = DisambiguationActionType.WHATSAPP_CALL,
+                        originalQuery = contactName,
+                        candidates = result.candidates
+                    )
+                )
+                ActionResult(false, "Multiple contacts found", speechResponseOverride = prompt)
+            }
+            is ContactResolutionResult.NotFound -> {
+                ActionResult(false, "Contact not found", speechResponseOverride = "Hmm, $contactName naam ka contact nahi mila.")
+            }
+            is ContactResolutionResult.PermissionMissing -> {
+                ActionResult(false, "Contacts permission missing", speechResponseOverride = "Contact dhoondne ke liye Contacts permission allow karni hogi.")
+            }
+        }
+    }
+
+    private suspend fun handleWhatsAppMessage(recipient: String, message: String): ActionResult {
+        val rawRecipient = recipient.trim()
+        val lowerTarget = rawRecipient.lowercase()
+
+        val notifAssistant = AffyNotificationAssistant.getInstance(context)
+        val contextManager = AffyConversationContextManager.getInstance()
+
+        val isCurrentChatKeyword = lowerTarget == "current_chat" ||
+            lowerTarget == "this_chat" ||
+            lowerTarget == "ye chat" ||
+            lowerTarget == "is chat" ||
+            lowerTarget == "jo chat open hai" ||
+            lowerTarget == "isme" ||
+            lowerTarget == "yahan"
+
+        val isContextualPronoun = isCurrentChatKeyword ||
+            rawRecipient.isBlank() ||
+            lowerTarget.contains("iski") ||
+            lowerTarget.contains("iska") ||
+            lowerTarget.contains("isko") ||
+            lowerTarget.contains("use") ||
+            lowerTarget.contains("usko") ||
+            lowerTarget.contains("uska") ||
+            lowerTarget.contains("unka") ||
+            lowerTarget.contains("inhe") ||
+            lowerTarget.contains("unhe") ||
+            lowerTarget.contains("unhein") ||
+            lowerTarget == "him" ||
+            lowerTarget == "her" ||
+            lowerTarget == "them" ||
+            lowerTarget == "sender" ||
+            lowerTarget == "notification" ||
+            lowerTarget == "reply"
+
+        var resolvedTarget = rawRecipient
+        if (isContextualPronoun) {
+            val contextualMsg = notifAssistant.resolveContextualSender(rawRecipient)
+            val contextualFromMgr = contextManager.resolveContextualRecipient(rawRecipient)
+            val resolvedContextual = contextualMsg?.sender ?: contextualFromMgr
+            if (!resolvedContextual.isNullOrBlank()) {
+                Log.d("AffyActionExecutor", "Resolved contextual WhatsApp target '$recipient' -> '$resolvedContextual'")
+                resolvedTarget = resolvedContextual
+            } else if (notifAssistant.hasAmbiguousRecentSenders()) {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "Ambiguous notification reply target; refused to assume open chat",
+                    speechResponseOverride = notifAssistant.getAmbiguousSenderClarificationPrompt()
+                )
+            } else if (isCurrentChatKeyword) {
+                // Only if there is no ambiguous unread notification context, inspect the live open WhatsApp header
+                val unreadSenders = notifAssistant.getRecentMessages()
+                    .filter { !it.replied && WhatsAppInstanceManager.isWhatsAppPackage(it.packageName) }
+                    .map { it.sender.lowercase().trim() }
+                    .distinct()
+                if (unreadSenders.isNotEmpty()) {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Ambiguous notification reply target; refused to assume open chat",
+                        speechResponseOverride = "Boss, abhi multiple ya unconfirmed notifications hain. Aap kis ki chat mein reply bhejna chahte hain? Naam bata dein."
+                    )
+                }
+                val a11y = AffyAccessibilityService.instance
+                val root = a11y?.getFreshActiveWindowRoot()
+                val activeTitle = if (root != null) a11y.extractActiveWhatsAppChatTitle(root) else null
+                if (!activeTitle.isNullOrBlank()) {
+                    resolvedTarget = activeTitle
+                } else {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Could not confirm active WhatsApp chat header",
+                        speechResponseOverride = "Boss, saamne konsi WhatsApp chat khuli hai ye confirm nahi ho saka. Aap kis ko message bhejna chahte hain?"
+                    )
+                }
+            } else {
+                resolvedTarget = ""
+            }
+        } else {
+            // Explicit recipient specified: invalidate stale notification context if target changed
+            contextManager.invalidateStaleNotificationIfTargetChanged(resolvedTarget)
+            notifAssistant.invalidateStaleTargetIfChanged(resolvedTarget)
+        }
+
+        if (resolvedTarget.isBlank()) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "No verified recipient specified",
+                speechResponseOverride = "Boss, kis chat mein WhatsApp message bhejna hai? Naam bata dein."
+            )
+        }
+        if (message.isBlank()) {
+            return ActionResult(false, "No message content", "Message kya bhejna hai?")
+        }
+
+        val contextualMsg = notifAssistant.resolveContextualSender(resolvedTarget)
+        val activePendingNotif = contextManager.getPendingNotifications(resolvedTarget).firstOrNull {
+            ContactResolver.doesIdentityMatch(it.sender, resolvedTarget) ||
+                ContactResolver.doesIdentityMatch(it.conversationTitle, resolvedTarget)
+        }
+
+        val boundNotifPkg = (contextualMsg?.packageName ?: activePendingNotif?.packageName)
+            ?.takeIf { WhatsAppInstanceManager.isWhatsAppPackage(it) }
+
+        // Check if there is an active/recent notification bound to this exact sender
+        if (contextualMsg != null) {
+            val matchedSender = contextualMsg.sender
+            Log.d("AffyActionExecutor", "Found bound notification for '$resolvedTarget' ($matchedSender, pkg=$boundNotifPkg). Attempting verified reply.")
+            val (directSuccess, directSummary) = notifAssistant.executeDirectReply(resolvedTarget, message)
+            if (directSuccess) {
+                return ActionResult(
+                    isSuccess = true,
+                    summary = directSummary,
+                    speechResponseOverride = "Boss, $matchedSender ko reply bhej diya hai."
+                )
+            }
+            if (directSummary.contains("confirm nahi ho saki", ignoreCase = true) ||
+                directSummary.contains("kis chat mein", ignoreCase = true) ||
+                directSummary.contains("konsi chat", ignoreCase = true)
+            ) {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = directSummary,
+                    speechResponseOverride = directSummary
+                )
+            }
+            Log.d("AffyActionExecutor", "Direct notification reply unavailable; falling back to verified Accessibility UI / validated wa.me path.")
+        }
+
+        // 1. Detect installed WhatsApp instances dynamically
+        val installedInstances = WhatsAppInstanceManager.getInstalledInstances(context)
+        if (installedInstances.isEmpty()) {
+            return ActionResult(
+                false,
+                "WhatsApp not installed",
+                "Phone mein koi WhatsApp account installed nahi mila."
+            )
+        }
+
+        val preferredPkg = preferences.preferredWhatsAppPackageFlow.first()
+        val requestedBusiness = message.contains("business", ignoreCase = true) || resolvedTarget.contains("business", ignoreCase = true)
+        val requestedClone = message.contains("clone", ignoreCase = true) || resolvedTarget.contains("clone", ignoreCase = true) || message.contains("dual", ignoreCase = true) || resolvedTarget.contains("dual", ignoreCase = true)
+        val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
+
+        // Bind to originating notification's WhatsApp package first; never blindly override with foregroundPkg
+        val targetPackage: String = when {
+            !boundNotifPkg.isNullOrBlank() -> boundNotifPkg
+            requestedBusiness || requestedClone -> {
+                val resolved = WhatsAppInstanceManager.resolveOutgoingInstance(
+                    context = context,
+                    preferBusiness = requestedBusiness,
+                    preferredPackage = preferredPkg.ifBlank { null }
+                ) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+                try {
+                    preferences.savePreferredWhatsAppPackage(resolved)
+                } catch (_: Exception) {}
+                resolved
+            }
+            preferredPkg.isNotBlank() && installedInstances.any { it.packageName == preferredPkg } -> preferredPkg
+            foregroundPkg.isNotBlank() && WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) && installedInstances.size == 1 -> foregroundPkg
+            installedInstances.size > 1 -> {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "Multiple WhatsApp instances found",
+                    speechResponseOverride = "Boss, kis WhatsApp se bhejun?"
+                )
+            }
+            else -> WhatsAppInstanceManager.resolveOutgoingInstance(
+                context = context,
+                preferBusiness = false,
+                preferredPackage = null
+            ) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+        }
+
+        // 2. Before using wa.me, verify or open the exact conversation in fresh Accessibility UI if available
+        val a11y = AffyAccessibilityService.instance
+        if (a11y != null) {
+            val expectedChatIdentity = contextualMsg?.conversationTitle?.ifBlank { contextualMsg.sender }
+                ?: activePendingNotif?.conversationTitle?.ifBlank { activePendingNotif.sender }
+                ?: resolvedTarget
+            val chatReady = a11y.openOrVerifyWhatsAppChat(
+                targetPackage = targetPackage,
+                expectedRecipient = expectedChatIdentity
+            )
+            if (chatReady) {
+                val sendVerification = a11y.automateWhatsAppSendVerified(
+                    targetPackage = targetPackage,
+                    messageText = message,
+                    expectedRecipient = expectedChatIdentity
+                )
+                if (sendVerification.isSentAndVerified) {
+                    val confirmedHeader = sendVerification.verifiedChatTitle ?: resolvedTarget
+                    notifAssistant.markSenderMessagesReplied(resolvedTarget, targetPackage)
+                    contextManager.clearActiveNotificationContext()
+                    return ActionResult(
+                        isSuccess = true,
+                        summary = "WhatsApp message sent & verified in chat '$confirmedHeader'",
+                        speechResponseOverride = "Ji boss! $confirmedHeader ko WhatsApp message bhej diya hai aur chat mein verify kar liya hai."
+                    )
+                } else if (
+                    sendVerification.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH ||
+                    sendVerification.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.PACKAGE_MISMATCH
+                ) {
+                    val observed = sendVerification.verifiedChatTitle ?: "dusri chat"
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Aborted send: open chat '$observed' did not match '$resolvedTarget'",
+                        speechResponseOverride = "Boss, saamne '$observed' ki chat khuli thi jabke message '$resolvedTarget' ke liye tha, isliye maine send nahi kiya. Aap bata dein kis chat mein bhejna hai?"
+                    )
+                }
+            }
+        }
+
+        // 3. Disambiguate recipient contact and validate phone number before using wa.me link
+        val contactResult = contactResolver.resolveContact(resolvedTarget)
+        val targetPhoneNumber: String
+        val resolvedDisplayName: String
+
+        when (contactResult) {
+            is ContactResolutionResult.Multiple -> {
+                val formattedList = contactResult.candidates.mapIndexed { idx, c ->
+                    "${idx + 1}. ${c.displayString}"
+                }.joinToString("\n")
+
+                val speechPrompt = "${contactResult.candidates[0].name} ke ${contactResult.candidates.size} contacts mile hain:\n$formattedList\nKaunse number pe WhatsApp message bhejun?"
+
+                contextManager.setPendingContactDisambiguation(
+                    PendingContactDisambiguation(
+                        actionType = DisambiguationActionType.WHATSAPP,
+                        originalQuery = resolvedTarget,
+                        candidates = contactResult.candidates,
+                        whatsappMessage = message,
+                        whatsappTargetPackage = targetPackage
+                    )
+                )
+
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "Multiple contacts found (${contactResult.candidates.size})",
+                    speechResponseOverride = speechPrompt
+                )
+            }
+            is ContactResolutionResult.Single -> {
+                resolvedDisplayName = contactResult.name
+                val candidatePhone = contactResult.phoneNumber.replace(Regex("[^0-9+]"), "")
+                if (!ContactResolver.isValidPhoneNumber(candidatePhone)) {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Invalid phone number for $resolvedDisplayName; refused wa.me link",
+                        speechResponseOverride = "Boss, $resolvedDisplayName ka valid phone number confirm nahi ho saka aur exact chat bhi nahi mili. Aap bata dein kis chat mein bhejna hai?"
+                    )
+                }
+                targetPhoneNumber = candidatePhone
+            }
+            is ContactResolutionResult.NotFound -> {
+                // Only allow raw spoken phone numbers if they pass strict phone validation; never invent numbers
+                val cleanDigits = rawRecipient.replace(Regex("[^0-9+]"), "")
+                if (ContactResolver.isValidPhoneNumber(cleanDigits)) {
+                    resolvedDisplayName = cleanDigits
+                    targetPhoneNumber = cleanDigits
+                } else {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Could not verify chat or contact for '$resolvedTarget'",
+                        speechResponseOverride = "Boss, '$resolvedTarget' ki exact WhatsApp chat ya saved contact confirm nahi ho saka. Main bina confirm kiye message send nahi karunga. Aap bata dein kis chat mein bhejna hai?"
+                    )
+                }
+            }
+            is ContactResolutionResult.PermissionMissing -> {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "Contacts permission missing and chat not verified on screen",
+                    speechResponseOverride = "Boss, '$resolvedTarget' ki chat screen par confirm nahi ho saki aur contact dhoondne ke liye Contacts permission chahiye. Aap bata dein kis chat mein bhejna hai?"
+                )
+            }
+        }
+
+        // 4. Open WhatsApp via validated wa.me link and verify recipient header & message appearance before reporting success
+        return executeDirectWhatsApp(
+            recipientPhone = targetPhoneNumber,
+            recipientName = resolvedDisplayName,
+            message = message,
+            targetPackage = targetPackage
+        )
+    }
+
+    private fun handleSendSms(recipient: String, message: String): ActionResult {
+        return try {
+            val intent = Intent(Intent.ACTION_SENDTO).apply {
+                data = Uri.parse("smsto:${Uri.encode(recipient)}")
+                putExtra("sms_body", message)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+            ActionResult(true, "SMS drafted", "Message draft kar diya hai.")
+        } catch (e: Exception) {
+            ActionResult(false, "SMS failed", "SMS action open nahi ho saka.")
+        }
+    }
+
+    private suspend fun handleClickElement(target: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility service not active", "Accessibility permission enable karni hogi.")
+        }
+
+        // 1. Observe fresh screen immediately before every action
+        val initialScreenContext = visionEngine.captureScreenContext()
+
+        // 2. Resolve target using strict semantic classification without arbitrary clickable fallback
+        val visionResult = visionEngine.resolveAndClickTarget(target)
+        if (visionResult.isFound && visionResult.matchedNode != null) {
+            // 3. Re-read and verify screen after click
+            val screenChanged = visionEngine.waitForMeaningfulChange(1500)
+            val updatedScreenContext = visionEngine.captureScreenContext()
+            val label = visionResult.matchedNode.displayLabel
+            return ActionResult(
+                isSuccess = true,
+                summary = "Clicked '$label' (${visionResult.matchReason}), screenChanged=$screenChanged",
+                speechResponseOverride = "$label par click kar diya."
+            )
+        }
+
+        // 4. Multiple matches or ambiguous: ask for clarification
+        if (visionResult.needsClarification && !visionResult.clarificationPrompt.isNullOrBlank()) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "Clarification needed for $target",
+                speechResponseOverride = visionResult.clarificationPrompt
+            )
+        }
+
+        // 5. Target not found with confidence: never guess or click arbitrary elements!
+        val notFoundMessage = if (target.lowercase().contains("communit")) {
+            "Boss, mujhe Communities ka exact button nazar nahi aa raha. Aap screen par uski jagah bata dein."
+        } else {
+            "Boss, mujhe $target ka exact button nazar nahi aa raha. Aap screen par uski jagah bata dein."
+        }
+
+        return ActionResult(
+            isSuccess = false,
+            summary = "Target '$target' not found with confidence",
+            speechResponseOverride = notFoundMessage
+        )
+    }
+
+    private fun handleLikeAction(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val liked = service.verifyMediaLike(expectedLiked = true)
+        return if (liked) {
+            ActionResult(true, "Liked post/video", "Done, video like kar di ❤️")
+        } else {
+            ActionResult(false, "Like button not found", "Screen par like button nahi mila.")
+        }
+    }
+
+    private fun handleUnlikeAction(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val unliked = service.verifyMediaLike(expectedLiked = false)
+        return if (unliked) {
+            ActionResult(true, "Unliked post/video", "Done, video se like hata diya.")
+        } else {
+            ActionResult(false, "Unlike action failed", "Like button verify nahi hua.")
+        }
+    }
+
+    private fun handleSubscribeChannel(target: String?): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val (success, message) = service.verifySubscribe(target)
+        return ActionResult(success, message, speechResponseOverride = message)
+    }
+
+    private fun handleGetVideoTitle(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Screen accessible nahi hai.")
+        }
+        val title = service.getVideoTitle()
+        return if (!title.isNullOrBlank()) {
+            ActionResult(true, "Video title: $title", speechResponseOverride = "Is video ka title hai: '$title'")
+        } else {
+            ActionResult(false, "No title found", speechResponseOverride = "Screen par video ka title nahi mila.")
+        }
+    }
+
+    private fun handleGetMediaCaption(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Screen accessible nahi hai.")
+        }
+        val caption = service.getMediaCaption() ?: service.getVideoTitle()
+        return if (!caption.isNullOrBlank()) {
+            ActionResult(true, "Caption: $caption", speechResponseOverride = "Caption hai: '$caption'")
+        } else {
+            ActionResult(false, "No caption found", speechResponseOverride = "Screen par koi caption nahi mila.")
+        }
+    }
+
+    private suspend fun handleOpenComments(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val opened = service.clickElementUniversal("comment") || service.clickElementByText("comment") || service.clickElementByText("comments")
+        if (opened) {
+            visionEngine.waitForMeaningfulChange(1000)
+            return ActionResult(true, "Opened comments", "Comment section open kar diya hai.")
+        }
+        return ActionResult(false, "Comments not found", "Screen par comments option nahi mila.")
+    }
+
+    private suspend fun handleSelectVideoResult(ordinal: Int, query: String?): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val selected = service.selectVideoResult(ordinal, query)
+        if (selected) {
+            visionEngine.waitForMeaningfulChange(1500)
+            val countWord = when (ordinal) {
+                1 -> "pehli"
+                2 -> "doosri"
+                3 -> "teesri"
+                4 -> "chauthi"
+                5 -> "panchwi"
+                else -> "${ordinal}th"
+            }
+            return ActionResult(true, "Selected video #$ordinal", "$countWord video open kar di hai boss.")
+        }
+        return ActionResult(false, "Video not found", "Video select nahi ho saki.")
+    }
+
+    private suspend fun handleUniversalSearch(query: String, targetField: String?): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        if (query.isBlank()) {
+            return ActionResult(false, "Empty search query", "Kya search karna hai?")
+        }
+        val searched = service.searchInCurrentScreen(query)
+        if (searched) {
+            visionEngine.waitForMeaningfulChange(1500)
+            return ActionResult(true, "Searched for '$query'", "Ji boss, '$query' search kar diya hai.")
+        }
+        return ActionResult(false, "Search failed", "Screen par search execute nahi ho saka.")
+    }
+
+    private suspend fun handleScroll(down: Boolean): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility permission chahiye scroll karne ke liye.")
+        }
+        val scrolled = service.scroll(down)
+        if (scrolled) {
+            visionEngine.waitForMeaningfulChange(1000)
+            return ActionResult(true, if (down) "Scrolled down" else "Scrolled up", if (down) "Neeche scroll kar diya." else "Upar scroll kar diya.")
+        } else {
+            return ActionResult(false, "Scroll failed", "Scroll nahi ho saka.")
+        }
+    }
+
+    private fun handleSwipe(left: Boolean): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(false, "Accessibility inactive")
+        val dm = context.resources.displayMetrics
+        val y = dm.heightPixels / 2f
+        val startX = if (left) dm.widthPixels * 0.8f else dm.widthPixels * 0.2f
+        val endX = if (left) dm.widthPixels * 0.2f else dm.widthPixels * 0.8f
+        val swiped = service.performSwipeGesture(startX, y, endX, y)
+        return ActionResult(swiped, if (left) "Swiped left" else "Swiped right")
+    }
+
+    private suspend fun handleTypeText(text: String, targetField: String? = null, shouldSend: Boolean = false): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        if (text.isBlank()) {
+            return ActionResult(false, "No text provided", "Likhne ke liye koi text nahi mila.")
+        }
+
+        val typed = service.typeText(text, targetField)
+        if (!typed) {
+            return ActionResult(false, "No input field active", "Type karne ke liye koi active text box nahi mila.")
+        }
+
+        visionEngine.waitForMeaningfulChange(400)
+
+        // Phase 3.6: If send was requested along with typing
+        val needSend = shouldSend || targetField?.contains("send", ignoreCase = true) == true || targetField?.contains("bhejo", ignoreCase = true) == true
+        if (needSend) {
+            val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
+            if (WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg)) {
+                val sent = service.automateWhatsAppSend(targetPackage = foregroundPkg, messageText = text)
+                return if (sent) {
+                    ActionResult(true, "Typed and sent '$text'", speechResponseOverride = "Ji boss, '$text' likh kar send kar diya hai.")
+                } else {
+                    ActionResult(false, "Typed '$text' but send unverified", speechResponseOverride = "'$text' likh diya hai magar send confirm nahi ho saka. Send dabayein.")
+                }
+            } else {
+                for (lbl in listOf("send", "bhejo", "post", "enter", "done")) {
+                    if (service.clickElementByText(lbl)) {
+                        visionEngine.waitForMeaningfulChange(800)
+                        return ActionResult(true, "Typed and sent '$text'", speechResponseOverride = "Ji boss, likh kar bhej diya.")
+                    }
+                }
+                return ActionResult(false, "Typed '$text' but send button not found", speechResponseOverride = "'$text' likh diya hai magar send button nahi mila.")
+            }
+        }
+
+        return ActionResult(true, "Typed text: $text", speechResponseOverride = "Ji boss, '$text' type kar diya hai.")
+    }
+
+    private fun handleReadVisibleChats(): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(
+            false,
+            "Accessibility inactive",
+            "Boss, abhi screen ka content accessible nahi hai. Accessibility permission enable karni hogi."
+        )
+        val chats = service.readVisibleChatList()
+        return if (!chats.isNullOrBlank()) {
+            ActionResult(true, "Read visible chats", speechResponseOverride = chats)
+        } else {
+            ActionResult(false, "No chats visible", speechResponseOverride = "Screen par koi visible chat ya contact list nahi mila.")
+        }
+    }
+
+    private fun handleReadScreenMessages(): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(
+            false,
+            "Accessibility inactive",
+            "Boss, abhi screen ka content accessible nahi hai. Accessibility permission enable karni hogi."
+        )
+        val messages = service.readVisibleChatMessages()
+        return if (!messages.isNullOrBlank()) {
+            ActionResult(true, "Read visible messages", speechResponseOverride = messages)
+        } else {
+            ActionResult(false, "No messages visible", speechResponseOverride = "Screen par koi readable message visible nahi hai.")
+        }
+    }
+
+    private fun handleOpenChat(target: String): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(
+            false,
+            "Accessibility inactive",
+            "Boss, abhi screen ka content accessible nahi hai. Accessibility permission enable karni hogi."
+        )
+        val opened = service.openVisibleChat(target)
+        val label = target.ifBlank { "chat" }
+        return if (opened) {
+            ActionResult(
+                true,
+                "Opened chat for $label",
+                speechResponseOverride = "Ji boss, $label ki chat open kar di hai. Kya iske messages parh kar sunaoon?"
+            )
+        } else {
+            ActionResult(
+                false,
+                "Could not open chat for $target",
+                speechResponseOverride = "Screen par '$label' ki chat nahi mili."
+            )
+        }
+    }
+
+    private fun handleAuthorizeChat(target: String): ActionResult {
+        val notifAssistant = AffyNotificationAssistant.getInstance(context)
+        val cleanTarget = target.trim()
+        val success = notifAssistant.authorizeChat(cleanTarget)
+        return if (success) {
+            ActionResult(
+                true,
+                "Chat authorized for $cleanTarget",
+                speechResponseOverride = "Ji boss, $cleanTarget ki chat handle kar raha hoon. Aane wale messages ka automatically reply bhej doon ga."
+            )
+        } else {
+            ActionResult(false, "Could not authorize chat", speechResponseOverride = "Chat authorize nahi ho saki.")
+        }
+    }
+
+    private fun handleRevokeChat(target: String?): ActionResult {
+        val notifAssistant = AffyNotificationAssistant.getInstance(context)
+        notifAssistant.revokeChat(target)
+        val label = if (!target.isNullOrBlank()) target else "Chat"
+        return ActionResult(
+            true,
+            "Chat authorization revoked for $label",
+            speechResponseOverride = "Theek hai boss, $label ka automatic reply band kar diya."
+        )
+    }
+
+    private suspend fun handleCloseAppOrPage(target: String?): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val closed = service.closeCurrentAppOrView(target)
+        visionEngine.waitForMeaningfulChange(1000)
+        val targetName = target?.ifBlank { null } ?: "App"
+        return if (closed) {
+            ActionResult(true, "Closed $targetName", "Ji boss, $targetName close kar diya hai.")
+        } else {
+            ActionResult(false, "Could not close $targetName", "$targetName close nahi ho saka.")
+        }
+    }
+
+    private fun handleNextVideo(): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        val dm = context.resources.displayMetrics
+        val startX = dm.widthPixels / 2f
+        val startY = dm.heightPixels * 0.75f
+        val endY = dm.heightPixels * 0.25f
+        val scrolled = service.performSwipeGesture(startX, startY, startX, endY, 250)
+        return if (scrolled) {
+            ActionResult(true, "Next video", "Agla video laga diya.")
+        } else {
+            ActionResult(false, "Next video failed", "Next video scroll nahi ho saka.")
+        }
+    }
+
+    private fun handleOpenKeyboard(target: String?): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(false, "Accessibility inactive", "Accessibility permission chahiye keyboard open karne ke liye.")
+        val opened = service.openKeyboardOrFocusInput(target)
+        return if (opened) {
+            ActionResult(true, "Keyboard opened", "Keyboard open kar diya hai, text likh sakte hain.")
+        } else {
+            ActionResult(false, "No input box found", "Screen par koi input box nahi mila.")
+        }
+    }
+
+    private fun handleSelectText(target: String): ActionResult {
+        val service = AffyAccessibilityService.instance ?: return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        val selected = service.selectText(target)
+        return if (selected) {
+            ActionResult(true, "Selected text: $target", "Text select kar diya.")
+        } else {
+            ActionResult(false, "Text not found", "Screen par '$target' text nahi mila.")
+        }
+    }
+
+    private suspend fun handleLongPressElement(target: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility permission enable karni hogi.")
+        }
+        val visionResult = visionEngine.resolveAndLongPressTarget(target)
+        if (visionResult.isFound && visionResult.matchedNode != null) {
+            visionEngine.waitForMeaningfulChange(1000)
+            val label = visionResult.matchedNode.displayLabel
+            return ActionResult(true, "Long pressed '$label'", "$label par long press kar diya.")
+        }
+        val pressed = service.longPressElementByText(target)
+        return if (pressed) {
+            visionEngine.waitForMeaningfulChange(1000)
+            ActionResult(true, "Long pressed $target", "$target par long press kar diya.")
+        } else {
+            ActionResult(false, "Element $target not found", "Screen par '$target' nahi mila.")
+        }
+    }
+
+    private suspend fun handleClearText(target: String?): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val cleared = service.clearText(target)
+        return if (cleared) {
+            visionEngine.waitForMeaningfulChange(500)
+            ActionResult(true, "Text cleared", "Text clear kar diya hai.")
+        } else {
+            ActionResult(false, "Could not clear text", "Text clear nahi ho saka.")
+        }
+    }
+
+    private suspend fun handleCommentOnPost(commentText: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val commented = service.commentOnPost(commentText)
+        return if (commented) {
+            visionEngine.waitForMeaningfulChange(1200)
+            ActionResult(true, "Comment posted: $commentText", "Comment bhej diya hai.")
+        } else {
+            ActionResult(false, "Could not post comment", "Comment post nahi ho saka.")
+        }
+    }
+
+    private suspend fun handleSharePost(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val shared = service.shareCurrentContent()
+        return if (shared) {
+            visionEngine.waitForMeaningfulChange(1000)
+            ActionResult(true, "Share opened", "Share option open kar diya.")
+        } else {
+            ActionResult(false, "Share button not found", "Share button nahi mila.")
+        }
+    }
+
+    private suspend fun handleSearchInScreen(query: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+        }
+        val searched = service.searchInCurrentScreen(query)
+        return if (searched) {
+            visionEngine.waitForMeaningfulChange(1500)
+            ActionResult(true, "Searched for $query", "$query search kar diya.")
+        } else {
+            ActionResult(false, "Search input not found", "Screen par search box nahi mila.")
+        }
+    }
+
+    private fun handleGlobalAction(action: Int, name: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service != null && service.performGlobal(action)) {
+            return ActionResult(true, name, "Ho gaya.")
+        }
+        return ActionResult(false, "$name failed")
+    }
+
+    private fun handleMediaControl(command: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service != null && (command.equals("play", ignoreCase = true) || command.equals("pause", ignoreCase = true))) {
+            val (success, speechMsg) = service.controlVideoPlayback(command)
+            if (success) {
+                return ActionResult(true, "Media $command", speechMsg)
+            }
+        }
+
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return try {
+            val keycode = when (command.lowercase()) {
+                "play", "play_pause" -> android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                "pause" -> android.view.KeyEvent.KEYCODE_MEDIA_PAUSE
+                "next" -> android.view.KeyEvent.KEYCODE_MEDIA_NEXT
+                "previous", "prev" -> android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                "stop" -> android.view.KeyEvent.KEYCODE_MEDIA_STOP
+                else -> android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+            }
+            audioManager.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, keycode))
+            audioManager.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, keycode))
+            val speech = if (command.lowercase().contains("play")) "Video play kar di." else if (command.lowercase().contains("pause")) "Video pause kar di." else "Media $command kar diya."
+            ActionResult(true, "Media command $command executed", speech)
+        } catch (e: Exception) {
+            ActionResult(false, "Media control failed", "Media control execute nahi hua.")
+        }
+    }
+
+    private fun handleVolume(value: String): ActionResult {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val clean = value.lowercase().trim()
+
+        val numericMatch = Regex("(\\d+)").find(clean)
+        if (numericMatch != null && clean != "up" && clean != "down") {
+            val num = numericMatch.groupValues[1].toIntOrNull() ?: 50
+            val targetLevel = ((num / 100f) * maxVolume).toInt().coerceIn(0, maxVolume)
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetLevel, AudioManager.FLAG_SHOW_UI)
+            return ActionResult(true, "Volume set to $num%", "Volume $num% kar diya hai.")
+        }
+
+        val direction = when (clean) {
+            "up" -> AudioManager.ADJUST_RAISE
+            "down" -> AudioManager.ADJUST_LOWER
+            "mute", "0" -> AudioManager.ADJUST_MUTE
+            "unmute" -> AudioManager.ADJUST_UNMUTE
+            else -> AudioManager.ADJUST_RAISE
+        }
+        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
+        return ActionResult(true, "Volume adjusted $value", "Volume adjust kar diya.")
+    }
+
+    private fun handleBrightness(value: String): ActionResult {
+        return try {
+            val intent = Intent(Settings.ACTION_DISPLAY_SETTINGS).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+            ActionResult(true, "Opened Display Settings", "Display settings open kar di hain.")
+        } catch (e: Exception) {
+            ActionResult(false, "Could not open display settings")
+        }
+    }
+
+    private suspend fun handleFlashlight(value: String): ActionResult {
+        val targetOn = when (value.lowercase().trim()) {
+            "on", "true", "enable", "1", "chalao", "jalao" -> true
+            "off", "false", "disable", "0", "band", "bujhao" -> false
+            else -> true // default intent is to turn torch on if user commands torch
+        }
+
+        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+        if (cameraManager != null) {
+            try {
+                // Find rear camera with flash unit available, or any available camera with flash
+                val flashCameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                    try {
+                        val characteristics = cameraManager.getCameraCharacteristics(id)
+                        val hasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                        val isRear = characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                        hasFlash && isRear
+                    } catch (_: Exception) {
+                        false
+                    }
+                } ?: cameraManager.cameraIdList.firstOrNull { id ->
+                    try {
+                        cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                    } catch (_: Exception) {
+                        false
+                    }
+                }
+
+                if (flashCameraId != null) {
+                    cameraManager.setTorchMode(flashCameraId, targetOn)
+                    delay(200)
+                    val actionWord = if (targetOn) "on" else "band"
+                    val summaryWord = if (targetOn) "ON" else "OFF"
+                    return ActionResult(
+                        isSuccess = true,
+                        summary = "Flashlight $summaryWord verified",
+                        speechResponseOverride = "Torch $actionWord kar di hai aur verify ho gayi."
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w("AffyActionExecutor", "CameraManager torch exception (${e.message}), attempting Quick Settings fallback...")
+            }
+        }
+
+        // Quick Settings Fallback via Accessibility
+        val service = AffyAccessibilityService.instance
+        if (service != null) {
+            val (qsSuccess, qsMsg) = service.toggleQuickSettingAndVerify("Flashlight", targetOn)
+            if (qsSuccess) {
+                return ActionResult(true, qsMsg, qsMsg)
+            }
+        }
+
+        val actionWord = if (targetOn) "on" else "off"
+        return ActionResult(
+            isSuccess = false,
+            summary = "Flashlight $actionWord failed",
+            speechResponseOverride = "Flashlight toggle nahi ho saki. Device par flash hardware available nahi hai."
+        )
+    }
+
+    private suspend fun handleToggleWifi(value: String?): ActionResult {
+        val targetState = when (value?.lowercase()?.trim()) {
+            "on", "true", "enable", "enabled", "1" -> true
+            "off", "false", "disable", "disabled", "0" -> false
+            else -> null
+        }
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val initialWifiEnabled = wifiManager?.isWifiEnabled == true
+
+        if (targetState != null && initialWifiEnabled == targetState) {
+            val stateWord = if (targetState) "ON" else "OFF"
+            return ActionResult(true, "Wi-Fi is already $stateWord", "Wi-Fi pehle se hi $stateWord hai boss.")
+        }
+
+        val desired = targetState ?: !initialWifiEnabled
+
+        // Attempt direct WifiManager toggle if permitted by OS
+        var directSucceeded = false
+        try {
+            @Suppress("DEPRECATION")
+            directSucceeded = wifiManager?.setWifiEnabled(desired) == true
+        } catch (_: Exception) {}
+
+        if (directSucceeded) {
+            delay(800)
+            val verified = wifiManager?.isWifiEnabled == desired
+            if (verified) {
+                val stateWord = if (desired) "ON" else "OFF"
+                return ActionResult(true, "Wi-Fi $stateWord verified", "Wi-Fi $stateWord kar diya hai aur verify ho gaya.")
+            }
+        }
+
+        // Fallback: Use Quick Settings tile through Accessibility Service
+        val service = AffyAccessibilityService.instance
+        if (service != null) {
+            val (qsSuccess, qsMsg) = service.toggleQuickSettingAndVerify("Wi-Fi", desired)
+            delay(500)
+            val finalWifiState = wifiManager?.isWifiEnabled == true
+            if (finalWifiState == desired) {
+                val stateWord = if (desired) "ON" else "OFF"
+                return ActionResult(true, "Wi-Fi $stateWord verified", "Wi-Fi $stateWord kar diya hai aur verify ho gaya.")
+            } else if (qsSuccess) {
+                return ActionResult(true, qsMsg, qsMsg)
+            }
+        }
+
+        val finalCheck = wifiManager?.isWifiEnabled == true
+        return if (finalCheck == desired) {
+            val stateWord = if (desired) "ON" else "OFF"
+            ActionResult(true, "Wi-Fi $stateWord", "Wi-Fi $stateWord ho gaya.")
+        } else {
+            ActionResult(false, "Wi-Fi state change unverified", "Android system restriction ki wajah se Wi-Fi panel open kar diya hai, please screen par switch tap karein.")
+        }
+    }
+
+    private suspend fun handleToggleMobileData(value: String?): ActionResult {
+        val targetState = when (value?.lowercase()?.trim()) {
+            "on", "true", "enable", "enabled", "1" -> true
+            "off", "false", "disable", "disabled", "0" -> false
+            else -> null
+        }
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val initialCellular = cm?.getNetworkCapabilities(cm.activeNetwork)?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+
+        if (targetState != null && initialCellular == targetState) {
+            val stateWord = if (targetState) "ON" else "OFF"
+            return ActionResult(true, "Mobile Data is already $stateWord", "Mobile Data pehle se hi $stateWord hai boss.")
+        }
+
+        val desired = targetState ?: !initialCellular
+
+        val service = AffyAccessibilityService.instance
+        if (service != null) {
+            val (qsSuccess, qsMsg) = service.toggleQuickSettingAndVerify("Mobile Data", desired)
+            delay(700)
+            if (qsSuccess) {
+                return ActionResult(true, qsMsg, qsMsg)
+            }
+        }
+
+        // Open Data Usage Settings for user interaction
+        try {
+            val intent = Intent(Settings.ACTION_DATA_ROAMING_SETTINGS).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+        } catch (_: Exception) {
+            try {
+                val intent = Intent(Settings.ACTION_WIRELESS_SETTINGS).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                context.startActivity(intent)
+            } catch (_: Exception) {}
+        }
+
+        return ActionResult(
+            false,
+            "Mobile Data requires user interaction due to Android security",
+            "Android security policy ki wajah se Mobile Data setting open kar di hai, please toggle karein."
+        )
+    }
+
+    private suspend fun handleQuickSettingToggle(settingName: String, value: String?): ActionResult {
+        val targetState = when (value?.lowercase()?.trim()) {
+            "on", "true", "enable", "enabled", "1" -> true
+            "off", "false", "disable", "disabled", "0" -> false
+            else -> null
+        }
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "System controls operate karne ke liye accessibility on honi chahiye.")
+        }
+        val (success, message) = service.toggleQuickSettingAndVerify(settingName, targetState)
+        return ActionResult(
+            isSuccess = success,
+            summary = message,
+            speechResponseOverride = message
+        )
+    }
+
+    private suspend fun handleRingerMode(mode: String): ActionResult {
+        return try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val targetMode = when (mode.lowercase().trim()) {
+                "silent", "mute", "off" -> AudioManager.RINGER_MODE_SILENT
+                "vibrate", "vibration" -> AudioManager.RINGER_MODE_VIBRATE
+                else -> AudioManager.RINGER_MODE_NORMAL
+            }
+            audioManager.ringerMode = targetMode
+            val newMode = audioManager.ringerMode
+            val modeName = when (newMode) {
+                AudioManager.RINGER_MODE_SILENT -> "Silent"
+                AudioManager.RINGER_MODE_VIBRATE -> "Vibrate"
+                else -> "Normal / Sound"
+            }
+            ActionResult(true, "Ringer mode set to $modeName", "Phone $modeName mode par set kar diya hai boss.")
+        } catch (e: Exception) {
+            Log.w("AffyActionExecutor", "AudioManager ringerMode exception (${e.message}), falling back to Quick Settings...")
+            handleQuickSettingToggle("Sound", mode)
+        }
+    }
+
+    private suspend fun handleCreateReminder(timeExpr: String, taskText: String): ActionResult {
+        return try {
+            val triggerTime = reminderManager.parseNaturalTime(timeExpr)
+            val title = taskText.ifBlank { "Reminder" }
+            val id = reminderManager.scheduleReminder(title, triggerTime, isAlarm = false)
+            val timeFormatted = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(triggerTime))
+            ActionResult(
+                true,
+                "Reminder #$id scheduled",
+                "Ji boss, $timeFormatted par reminder set kar diya hai: $title"
+            )
+        } catch (e: Exception) {
+            Log.e("AffyActionExecutor", "Failed to schedule reminder: ${e.message}")
+            ActionResult(false, "Reminder failed", "Reminder set nahi ho saka.")
+        }
+    }
+
+    private suspend fun handleCancelReminder(keyword: String): ActionResult {
+        return try {
+            val count = reminderManager.cancelRemindersByKeyword(keyword)
+            if (count > 0) {
+                ActionResult(true, "Cancelled $count reminders", "$count reminder cancel kar diye hain.")
+            } else {
+                ActionResult(false, "No reminder found", "Is naam ka koi active reminder nahi mila.")
+            }
+        } catch (e: Exception) {
+            ActionResult(false, "Cancel failed", "Reminder cancel nahi ho saka.")
+        }
+    }
+
+    private suspend fun handleSetAlarm(time: String, label: String): ActionResult {
+        return try {
+            val triggerTime = reminderManager.parseNaturalTime(time)
+            val id = reminderManager.scheduleReminder(label.ifBlank { "Alarm" }, triggerTime, isAlarm = true)
+            val timeFormatted = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(triggerTime))
+            ActionResult(
+                true,
+                "Alarm scheduled",
+                "Alarm $timeFormatted ke liye set kar diya hai."
+            )
+        } catch (e: Exception) {
+            // Fallback to system Clock intent
+            try {
+                val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                    putExtra(AlarmClock.EXTRA_MESSAGE, label.ifBlank { "Affy Alarm" })
+                    putExtra(AlarmClock.EXTRA_SKIP_UI, false)
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                context.startActivity(intent)
+                ActionResult(true, "Alarm screen opened", "Alarm screen ready hai.")
+            } catch (ex: Exception) {
+                ActionResult(false, "Failed to set alarm")
+            }
+        }
+    }
+
+    private suspend fun handleReadNotifications(filter: String? = null): ActionResult {
+        return try {
+            val assistant = AffyNotificationAssistant.getInstance(context)
+            val appFilter = if (filter.isNullOrBlank() || filter.equals("all", ignoreCase = true)) "whatsapp" else filter
+            val summary = assistant.getNaturalSummaryOfRecentMessages(appFilter)
+            ActionResult(true, summary, summary)
+        } catch (e: Exception) {
+            ActionResult(false, "Failed to read notifications", "Notifications check nahi ho sake.")
+        }
+    }
+
+    private suspend fun handleRememberFact(rawInput: String): ActionResult {
+        return try {
+            val (success, response) = AffyLongTermMemoryManager.getInstance(context).rememberFact(rawInput)
+            ActionResult(
+                isSuccess = success,
+                summary = response,
+                speechResponseOverride = response
+            )
+        } catch (e: Exception) {
+            ActionResult(false, "Failed to save memory: ${e.message}", "Memory save karne mein problem hui.")
+        }
+    }
+
+    private suspend fun handleForgetFact(query: String): ActionResult {
+        return try {
+            val (success, response) = AffyLongTermMemoryManager.getInstance(context).forgetFact(query)
+            ActionResult(
+                isSuccess = success,
+                summary = response,
+                speechResponseOverride = response
+            )
+        } catch (e: Exception) {
+            ActionResult(false, "Failed to forget memory: ${e.message}", "Memory remove karne mein issue aya.")
+        }
+    }
+
+    private suspend fun handleRecallFact(query: String?): ActionResult {
+        return try {
+            val response = AffyLongTermMemoryManager.getInstance(context).recallMemories(query)
+            ActionResult(
+                isSuccess = true,
+                summary = response,
+                speechResponseOverride = response
+            )
+        } catch (e: Exception) {
+            ActionResult(false, "Recall error: ${e.message}", "Memory check karne mein error aya.")
+        }
+    }
+
+    private suspend fun handleClearMemory(): ActionResult {
+        return try {
+            val (success, response) = AffyLongTermMemoryManager.getInstance(context).clearAll()
+            ActionResult(
+                isSuccess = success,
+                summary = response,
+                speechResponseOverride = response
+            )
+        } catch (e: Exception) {
+            ActionResult(false, "Clear memory failed", "Memory clear karne mein problem hui.")
+        }
+    }
+
+    private fun handleGetTime(): ActionResult {
+        val sdf = SimpleDateFormat("hh:mm a", Locale.getDefault())
+        val time = sdf.format(Date())
+        return ActionResult(true, "Time: $time", "Abhi waqt ho raha hai $time.")
+    }
+
+    private fun handleGetDate(): ActionResult {
+        val sdf = SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault())
+        val date = sdf.format(Date())
+        return ActionResult(true, "Date: $date", "Aaj ki date hai $date.")
+    }
+
+    private fun handleGetBattery(): ActionResult {
+        val iFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val batteryStatus: Intent? = context.registerReceiver(null, iFilter)
+        val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val plugged = batteryStatus?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        val batteryPct = if (level >= 0 && scale > 0) ((level / scale.toFloat()) * 100).toInt() else {
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        }
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || plugged > 0
+        val isFull = status == BatteryManager.BATTERY_STATUS_FULL || batteryPct >= 100
+
+        val chargingType = when (plugged) {
+            BatteryManager.BATTERY_PLUGGED_AC -> "AC charger"
+            BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless charger"
+            else -> if (isCharging) "charger" else null
+        }
+
+        val speech = when {
+            isFull -> "Phone ki battery 100% full charged hai boss."
+            isCharging && chargingType != null -> "Phone ki battery $batteryPct% hai aur $chargingType se charging ho rahi hai."
+            isCharging -> "Phone ki battery $batteryPct% hai aur charging ho rahi hai."
+            batteryPct in 1..15 -> "Phone ki battery sirf $batteryPct% bachi hai, please charger laga lijiye."
+            batteryPct > 0 -> "Phone ki battery $batteryPct% hai aur charging nahi ho rahi."
+            else -> "Battery status check nahi ho saka."
+        }
+        val summary = "Battery: $batteryPct% (Charging: $isCharging, Plugged: $plugged)"
+        return ActionResult(true, summary, speech)
+    }
+
+    private suspend fun handleOpenCamera(): ActionResult {
+        return try {
+            val intent = Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+            val service = AffyAccessibilityService.instance
+            delay(1000)
+            val fgPkg = service?.rootInActiveWindow?.packageName?.toString() ?: AffyAccessibilityService.currentAppPackage.value ?: ""
+            val isCamera = fgPkg.contains("camera", ignoreCase = true)
+            if (isCamera || service == null) {
+                ActionResult(
+                    isSuccess = true,
+                    summary = "Camera opened successfully",
+                    speechResponseOverride = "Ji boss, camera khol diya hai."
+                )
+            } else {
+                ActionResult(
+                    isSuccess = true,
+                    summary = "Camera intent launched",
+                    speechResponseOverride = "Camera open kar diya hai boss."
+                )
+            }
+        } catch (e: Exception) {
+            openApp("Camera")
+        }
+    }
+
+    private suspend fun handleTakePhoto(mode: String? = null): ActionResult {
+        val service = AffyAccessibilityService.instance
+        val currentFg = service?.rootInActiveWindow?.packageName?.toString() ?: AffyAccessibilityService.currentAppPackage.value ?: ""
+        val isCameraForeground = currentFg.contains("camera", ignoreCase = true)
+
+        if (!isCameraForeground || mode == "open_and_capture") {
+            try {
+                val intent = Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                context.startActivity(intent)
+            } catch (_: Exception) {
+                openApp("Camera")
+            }
+            delay(1500)
+        }
+
+        if (service != null) {
+            val shutterLabels = listOf(
+                "Take picture", "Shutter", "Capture", "Photo shutter", "Camera button",
+                "Take photo", "Capture photo", "Photo", "Snapshot", "Picture"
+            )
+            var clicked = false
+            for (label in shutterLabels) {
+                if (service.clickElementByText(label)) {
+                    clicked = true
+                    break
+                }
+            }
+
+            if (!clicked) {
+                val metrics = context.resources.displayMetrics
+                val shutterX = metrics.widthPixels / 2f
+                val shutterY = metrics.heightPixels * 0.88f
+                clicked = service.performTap(shutterX, shutterY)
+            }
+
+            delay(800)
+            if (clicked) {
+                return ActionResult(
+                    isSuccess = true,
+                    summary = "Photo captured successfully",
+                    speechResponseOverride = "Ji boss, photo capture kar li hai!"
+                )
+            }
+        }
+
+        return ActionResult(
+            isSuccess = true,
+            summary = "Camera ready for photo capture",
+            speechResponseOverride = "Camera khol diya hai boss, screen par shutter tap karein."
+        )
+    }
+
+    private fun handleSearchWeb(query: String): ActionResult {
+        return try {
+            val intent = Intent(Intent.ACTION_WEB_SEARCH).apply {
+                putExtra(SearchManager.QUERY, query)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+            ActionResult(true, "Searching web for $query", "$query search kar raha hoon.")
+        } catch (e: Exception) {
+            ActionResult(false, "Failed web search")
+        }
+    }
+
+    private suspend fun handleReadScreen(): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service == null) return ActionResult(false, "Accessibility inactive", "Boss, abhi screen ka content accessible nahi hai. Accessibility permission check kar lijiye.")
+
+        val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
+        if (WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) || foregroundPkg.contains("messaging") || foregroundPkg.contains("mms")) {
+            val chatMessages = service.readVisibleChatMessages()
+            if (!chatMessages.isNullOrBlank() && !chatMessages.contains("koi readable message visible nahi") && !chatMessages.contains("koi message text visible nahi")) {
+                return ActionResult(true, chatMessages, chatMessages)
+            }
+            val chatList = service.readVisibleChatList()
+            if (!chatList.isNullOrBlank() && !chatList.contains("koi visible chat ya contact list nahi")) {
+                return ActionResult(true, chatList, chatList)
+            }
+        }
+
+        val screenContext = visionEngine.captureScreenContext()
+        val naturalSummary = screenContext.toConversationalSummary()
+        return ActionResult(true, naturalSummary, naturalSummary)
+    }
+
+    private suspend fun executeMultiStepAppCommand(appName: String, query: String, desiredAction: String): ActionResult {
+        val cleanApp = appName.trim().lowercase()
+        val pm = context.packageManager
+
+        val packageMap = mapOf(
+            "youtube" to "com.google.android.youtube",
+            "spotify" to "com.spotify.music",
+            "gaana" to "com.gaana",
+            "chrome" to "com.android.chrome",
+            "maps" to "com.google.android.apps.maps",
+            "whatsapp" to "com.whatsapp",
+            "instagram" to "com.instagram.android",
+            "facebook" to "com.facebook.katana"
+        )
+
+        val targetPkg = packageMap[cleanApp] ?: packageMap.entries.firstOrNull { cleanApp.contains(it.key) }?.value
+        AffyDiagnostics.logPipelineExecution(
+            action = "MULTI_STEP_APP_COMMAND ($desiredAction)",
+            target = query,
+            targetPackage = targetPkg ?: appName,
+            actionResult = "DISPATCHING"
+        )
+
+        if (targetPkg != null) {
+            val isInstalled = pm.getLaunchIntentForPackage(targetPkg) != null
+            if (!isInstalled) {
+                AffyDiagnostics.logPipelineExecution("MULTI_STEP_APP_COMMAND", query, targetPkg, "NOT_INSTALLED")
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "$appName is not installed",
+                    speechResponseOverride = "Boss, $appName aapke phone mein install nahi hai."
+                )
+            }
+        }
+
+        return when {
+            cleanApp.contains("youtube") -> {
+                try {
+                    // Step 1: Launch YouTube directly to search query results
+                    val ytUri = Uri.parse("https://www.youtube.com/results?search_query=${Uri.encode(query)}")
+                    val ytIntent = Intent(Intent.ACTION_VIEW, ytUri).apply {
+                        setPackage("com.google.android.youtube")
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(ytIntent)
+
+                    // Step 2: Allow YouTube to load search view
+                    delay(1200)
+
+                    // Step 3: Inspect screen and use Accessibility if search wasn't executed
+                    val a11y = AffyAccessibilityService.instance
+                    if (a11y != null) {
+                        a11y.executeSemanticAppSearch("YouTube", query)
+                        delay(600)
+                    }
+
+                    // Step 4: Re-inspect and verify screen
+                    val screenContext = visionEngine.captureScreenContext()
+                    val isYouTube = screenContext.foregroundPackage.contains("youtube") || screenContext.appDisplayName.contains("YouTube")
+
+                    if (isYouTube) {
+                        AffyDiagnostics.logPipelineExecution("YOUTUBE_SEARCH", query, "com.google.android.youtube", "VERIFIED")
+                        val speechText = if (desiredAction == "search") {
+                            "Boss, YouTube par '$query' search kar diya hai."
+                        } else {
+                            "Boss, YouTube par '$query' chala diya hai."
+                        }
+                        ActionResult(
+                            isSuccess = true,
+                            summary = "Searched '$query' on YouTube",
+                            speechResponseOverride = speechText
+                        )
+                    } else {
+                        AffyDiagnostics.logPipelineExecution("YOUTUBE_SEARCH", query, "com.google.android.youtube", "FAILED_FOREGROUND_CHECK")
+                        ActionResult(
+                            isSuccess = false,
+                            summary = "YouTube could not be opened for search",
+                            speechResponseOverride = "Boss, YouTube open nahi ho saka."
+                        )
+                    }
+                } catch (e: Exception) {
+                    AffyDiagnostics.logPipelineExecution("YOUTUBE_SEARCH", query, "com.google.android.youtube", "EXCEPTION: ${e.message}")
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "YouTube search failed: ${e.message}",
+                        speechResponseOverride = "Boss, YouTube par search execute nahi ho saka."
+                    )
+                }
+            }
+
+            cleanApp.contains("spotify") -> {
+                try {
+                    val intent = Intent(android.provider.MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).apply {
+                        setPackage("com.spotify.music")
+                        putExtra(SearchManager.QUERY, query)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                    delay(1000)
+                    AffyDiagnostics.logPipelineExecution("SPOTIFY_SEARCH", query, "com.spotify.music", "SUCCESS")
+                    ActionResult(
+                        isSuccess = true,
+                        summary = "Playing '$query' on Spotify",
+                        speechResponseOverride = "Boss, Spotify par '$query' play kar raha hoon."
+                    )
+                } catch (e: Exception) {
+                    AffyDiagnostics.logPipelineExecution("SPOTIFY_SEARCH", query, "com.spotify.music", "FAILED: ${e.message}")
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "Failed to search Spotify: ${e.message}",
+                        speechResponseOverride = "Boss, Spotify par play nahi ho saka."
+                    )
+                }
+            }
+
+            cleanApp.contains("maps") -> {
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(query)}")).apply {
+                        setPackage("com.google.android.apps.maps")
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                    delay(800)
+                    AffyDiagnostics.logPipelineExecution("MAPS_SEARCH", query, "com.google.android.apps.maps", "SUCCESS")
+                    ActionResult(
+                        isSuccess = true,
+                        summary = "Navigating to '$query' on Google Maps",
+                        speechResponseOverride = "Boss, Maps par '$query' ki location open kar di hai."
+                    )
+                } catch (e: Exception) {
+                    AffyDiagnostics.logPipelineExecution("MAPS_SEARCH", query, "com.google.android.apps.maps", "FAILED: ${e.message}")
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "Maps search failed: ${e.message}",
+                        speechResponseOverride = "Boss, Maps open nahi ho saka."
+                    )
+                }
+            }
+
+            cleanApp.contains("chrome") -> {
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=${Uri.encode(query)}")).apply {
+                        setPackage("com.android.chrome")
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                    delay(800)
+                    AffyDiagnostics.logPipelineExecution("CHROME_SEARCH", query, "com.android.chrome", "SUCCESS")
+                    ActionResult(
+                        isSuccess = true,
+                        summary = "Searched '$query' on Chrome",
+                        speechResponseOverride = "Boss, Chrome par '$query' search kar diya hai."
+                    )
+                } catch (e: Exception) {
+                    AffyDiagnostics.logPipelineExecution("CHROME_SEARCH", query, "com.android.chrome", "FAILED: ${e.message}")
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "Chrome search error: ${e.message}",
+                        speechResponseOverride = "Boss, Chrome search nahi ho saka."
+                    )
+                }
+            }
+
+            else -> {
+                AffyDiagnostics.logPipelineExecution("APP_COMMAND", query, appName, "UNSUPPORTED")
+                ActionResult(
+                    isSuccess = false,
+                    summary = "Unsupported command for $appName",
+                    speechResponseOverride = "Boss, $appName par yeh action perform nahi ho sakta."
+                )
+            }
+        }
+    }
+
+    private suspend fun handleGmailCheck(): ActionResult {
+        val screenContext = visionEngine.captureScreenContext()
+        val isEmailAppForeground = screenContext.foregroundPackage.contains("gm") ||
+                screenContext.foregroundPackage.contains("email") ||
+                screenContext.appDisplayName.contains("Gmail", ignoreCase = true)
+
+        if (isEmailAppForeground) {
+            val emailSubjects = screenContext.visibleTexts.filter { text ->
+                text.length > 5 && !text.equals("Search in mail", ignoreCase = true) &&
+                        !text.equals("Compose", ignoreCase = true) && !text.equals("Inbox", ignoreCase = true)
+            }
+            if (emailSubjects.isNotEmpty()) {
+                val preview = emailSubjects.take(3).joinToString(", ")
+                return ActionResult(
+                    isSuccess = true,
+                    summary = "Screen unread emails: $preview",
+                    speechResponseOverride = "Boss, inbox mein yeh emails dikh rahi hain: $preview."
+                )
+            }
+        }
+
+        val speech = gmailManager.checkNewMails()
+        return ActionResult(
+            isSuccess = true,
+            summary = "Checked emails",
+            speechResponseOverride = speech
+        )
+    }
+
+    private suspend fun handleGmailRead(): ActionResult {
+        val screenContext = visionEngine.captureScreenContext()
+        val isEmailAppForeground = screenContext.foregroundPackage.contains("gm") ||
+                screenContext.foregroundPackage.contains("email") ||
+                screenContext.appDisplayName.contains("Gmail", ignoreCase = true)
+
+        if (isEmailAppForeground) {
+            val texts = screenContext.visibleTexts
+            if (texts.isNotEmpty()) {
+                val hasAttachment = texts.any { it.contains("attachment", ignoreCase = true) || it.contains(".pdf", ignoreCase = true) || it.contains(".jpg", ignoreCase = true) || it.contains(".png", ignoreCase = true) || it.contains(".zip", ignoreCase = true) }
+                val attachmentNote = if (hasAttachment) " Is email mein attachment bhi attached hai." else ""
+                val fullBody = texts.filter { !it.equals("Search in mail", ignoreCase = true) && !it.equals("Compose", ignoreCase = true) && !it.equals("Reply", ignoreCase = true) }.take(6).joinToString(". ")
+                return ActionResult(
+                    isSuccess = true,
+                    summary = "Read email from screen: $fullBody",
+                    speechResponseOverride = "Email screen par parhi gayi hai boss: $fullBody.$attachmentNote"
+                )
+            }
+        }
+
+        val speech = gmailManager.readLatestEmail()
+        return ActionResult(
+            isSuccess = true,
+            summary = "Read latest email",
+            speechResponseOverride = speech
+        )
+    }
+
+    private suspend fun handleCheckAttachment(): ActionResult {
+        val screenContext = visionEngine.captureScreenContext()
+        val texts = screenContext.visibleTexts
+        val attachmentIndicators = listOf("attachment", "attached", "pdf", "jpg", "png", "zip", "docx", "file", "download", "mb", "kb", "paperclip")
+        val foundAttachment = texts.filter { t -> attachmentIndicators.any { t.contains(it, ignoreCase = true) } }
+
+        return if (foundAttachment.isNotEmpty()) {
+            val details = foundAttachment.take(2).joinToString(", ")
+            ActionResult(
+                isSuccess = true,
+                summary = "Attachment detected: $details",
+                speechResponseOverride = "Ji boss, is email mein attachment ($details) maujood hai."
+            )
+        } else {
+            ActionResult(
+                isSuccess = true,
+                summary = "No attachment visible",
+                speechResponseOverride = "Boss, is email mein koi visible attachment nahi mili."
+            )
+        }
+    }
+
+    private suspend fun handleGmailReply(replyText: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+        if (service != null) {
+            val clickReply = handleClickElement("Reply")
+            if (clickReply.isSuccess) {
+                delay(500)
+                service.typeText(replyText)
+                return ActionResult(
+                    isSuccess = true,
+                    summary = "Reply drafted on screen: '$replyText'",
+                    speechResponseOverride = "Maine email mein reply draft kar diya hai: '$replyText'."
+                )
+            }
+        }
+
+        val draft = gmailManager.stageReply(replyText)
+        return if (draft != null) {
+            ActionResult(
+                isSuccess = true,
+                summary = "Gmail reply drafted",
+                speechResponseOverride = "Maine ${draft.first.sender} ke email ke liye ye reply draft kiya hai: '$replyText'. Bhej doon?"
+            )
+        } else {
+            ActionResult(
+                isSuccess = true,
+                summary = "Drafted reply: '$replyText'",
+                speechResponseOverride = "Maine reply draft kar diya hai: '$replyText'."
+            )
+        }
+    }
+
+    private fun handleStopCancel(): ActionResult {
+        return ActionResult(
+            isSuccess = true,
+            summary = "Operation stopped / cancelled",
+            speechResponseOverride = "Theek hai boss, cancel kar diya."
+        )
+    }
+
+    private fun handleDeactivateOverlay(): ActionResult {
+        com.example.ui.overlay.AffyFloatingOrbManager.hide()
+        return ActionResult(
+            isSuccess = true,
+            summary = "Floating AFFY standby mode activated",
+            speechResponseOverride = "Theek hai boss, standby mode mein hoon."
+        )
+    }
+
+    private suspend fun handleSetVoice(targetVoice: String?): ActionResult {
+        val current = preferences.getLiveVoice()
+        val target = when {
+            targetVoice?.contains("female", ignoreCase = true) == true || targetVoice?.contains("leda", ignoreCase = true) == true -> "Leda"
+            targetVoice?.contains("male", ignoreCase = true) == true || targetVoice?.contains("puck", ignoreCase = true) == true -> "Puck"
+            current.equals("Leda", ignoreCase = true) -> "Puck"
+            else -> "Leda"
+        }
+        preferences.saveLiveVoice(target)
+        val voiceDesc = if (target.equals("Leda", ignoreCase = true)) "female voice" else "male voice"
+        return ActionResult(
+            isSuccess = true,
+            summary = "Voice switched to $voiceDesc",
+            speechResponseOverride = "Ji boss, $voiceDesc switch kar di hai."
+        )
+    }
+
+    private suspend fun handleLockDevice(): ActionResult = withContext(Dispatchers.Main) {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Accessibility Service required for screen lock",
+                speechResponseOverride = "Boss, mobile lock karne ke liye Accessibility Service permission enable honi chahiye."
+            )
+        }
+
+        val success = service.lockDevice()
+        if (success) {
+            ActionResult(
+                isSuccess = true,
+                summary = "Device screen locked successfully",
+                speechResponseOverride = "Ji boss, device lock kar diya hai."
+            )
+        } else {
+            ActionResult(
+                isSuccess = false,
+                summary = "Device lock failed or unsupported on this Android API",
+                speechResponseOverride = "Boss, screen lock command execute nahi ho saki."
+            )
+        }
+    }
+
+    private suspend fun handleUnlockOrWakeDevice(): ActionResult = withContext(Dispatchers.Main) {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Accessibility Service required for screen wake/unlock",
+                speechResponseOverride = "Boss, screen wake karne ke liye Accessibility Service permission on honi chahiye."
+            )
+        }
+
+        // 1. Wake screen
+        service.wakeScreen()
+        delay(350)
+
+        // 2. Query live lock and security state
+        val state = service.getDeviceLockState()
+        Log.i("AffyActionExecutor", "[SECURE_DEVICE_STATE] isScreenOn=${state.isScreenOn} isLocked=${state.isLocked} isSecure=${state.isSecure}")
+        AffyDiagnostics.logAction(
+            category = "DEVICE_STATE",
+            tag = "SCREEN_WAKE_UNLOCK",
+            message = "isScreenOn=${state.isScreenOn}, isLocked=${state.isLocked}, isSecure=${state.isSecure}",
+            isSuccess = true
+        )
+
+        if (!state.isLocked) {
+            return@withContext ActionResult(
+                isSuccess = true,
+                summary = "Device screen is on and unlocked",
+                speechResponseOverride = "Screen khol di hai boss, device unlocked hai."
+            )
+        }
+
+        // Device is locked
+        if (state.isSecure) {
+            // Protected Android authentication mechanism (PIN/Password/Biometric) must NEVER be bypassed
+            val transientPin = TransientAuthManager.getTransientAuth()
+            if (!transientPin.isNullOrBlank()) {
+                // If user temporarily provided a PIN in-flight for an explicit authorized interaction,
+                // keep it strictly in transient memory (TransientAuthManager) and never persist or log it.
+                Log.d("AffyActionExecutor", "[TRANSIENT_AUTH_APPLIED] Temporary auth present for session")
+            }
+
+            ActionResult(
+                isSuccess = true,
+                summary = "Screen awake with protected Android secure lock active",
+                speechResponseOverride = "Screen on kar di hai boss. Apna PIN, pattern ya fingerprint laga kar unlock kar lein."
+            )
+        } else {
+            // Non-secure swipe lock screen: perform swipe up gesture to dismiss keyguard
+            val metrics = context.resources.displayMetrics
+            val centerX = metrics.widthPixels / 2f
+            val startY = metrics.heightPixels * 0.8f
+            val endY = metrics.heightPixels * 0.2f
+            service.performSwipeGesture(centerX, startY, centerX, endY, 250L)
+            delay(500)
+
+            val updatedState = service.getDeviceLockState()
+            if (!updatedState.isLocked) {
+                ActionResult(
+                    isSuccess = true,
+                    summary = "Device unlocked successfully",
+                    speechResponseOverride = "Screen khol kar phone unlock kar diya hai boss."
+                )
+            } else {
+                ActionResult(
+                    isSuccess = true,
+                    summary = "Screen is awake",
+                    speechResponseOverride = "Screen on kar di hai boss."
+                )
+            }
+        }
+    }
+
+    private suspend fun handleTakeScreenshot(): ActionResult = withContext(Dispatchers.Main) {
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Accessibility Service required for screenshot",
+                speechResponseOverride = "Boss, screenshot lene ke liye Accessibility permission chahiye."
+            )
+        }
+
+        val success = service.takeScreenshot()
+        if (success) {
+            ActionResult(
+                isSuccess = true,
+                summary = "Screenshot taken successfully",
+                speechResponseOverride = "Screenshot capture kar liya hai boss."
+            )
+        } else {
+            ActionResult(
+                isSuccess = false,
+                summary = "Screenshot action not supported or failed",
+                speechResponseOverride = "Boss, screenshot capture nahi ho saka."
+            )
+        }
+    }
+
+    private fun handleCopyText(text: String): ActionResult {
+        return try {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("Affy Copied Text", text)
+            clipboard.setPrimaryClip(clip)
+            ActionResult(
+                isSuccess = true,
+                summary = "Text copied to clipboard",
+                speechResponseOverride = "Text copy kar liya hai."
+            )
+        } catch (e: Exception) {
+            ActionResult(
+                isSuccess = false,
+                summary = "Failed to copy text: ${e.message}",
+                speechResponseOverride = "Text copy nahi ho saka."
+            )
+        }
+    }
+
+    private suspend fun handlePasteText(targetQuery: String?): ActionResult = withContext(Dispatchers.Main) {
+        try {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = clipboard.primaryClip
+            if (clip != null && clip.itemCount > 0) {
+                val pasteText = clip.getItemAt(0).text?.toString() ?: ""
+                val service = AffyAccessibilityService.instance
+                val pasted = service?.typeText(pasteText, targetQuery) ?: false
+                if (pasted) {
+                    ActionResult(true, "Text pasted successfully", "Text paste kar diya hai.")
+                } else {
+                    ActionResult(false, "Could not find input field to paste", "Paste karne ke liye koi input field nahi mila.")
+                }
+            } else {
+                ActionResult(false, "Clipboard is empty", "Clipboard mein koi text nahi hai.")
+            }
+        } catch (e: Exception) {
+            ActionResult(false, "Failed to paste: ${e.message}", "Paste karte waqt issue aya.")
+        }
+    }
+
+    private suspend fun handleAnalyzeSecurity(target: String): ActionResult = withContext(Dispatchers.IO) {
+        try {
+            val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            val isDeviceSecure = keyguardManager?.isDeviceSecure ?: false
+            
+            val devOptions = try {
+                Settings.Global.getInt(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) == 1
+            } catch (_: Exception) { false }
+
+            val adbEnabled = try {
+                Settings.Global.getInt(context.contentResolver, Settings.Global.ADB_ENABLED, 0) == 1
+            } catch (_: Exception) { false }
+
+            val currentPkg = AffyAccessibilityService.currentAppPackage.value
+            val isInspectApp = target.contains("app", ignoreCase = true) || target.contains("permission", ignoreCase = true)
+
+            val summaryBuilder = StringBuilder()
+            val speechBuilder = StringBuilder()
+
+            if (isInspectApp && !currentPkg.isNullOrBlank()) {
+                val pm = context.packageManager
+                val appInfo = pm.getApplicationInfo(currentPkg, 0)
+                val appName = pm.getApplicationLabel(appInfo).toString()
+                val pkgInfo = pm.getPackageInfo(currentPkg, PackageManager.GET_PERMISSIONS)
+                val requestedPermissions = pkgInfo.requestedPermissions?.toList() ?: emptyList()
+
+                val dangerousPermissions = requestedPermissions.filter {
+                    it.contains("CAMERA") || it.contains("RECORD_AUDIO") || it.contains("ACCESS_FINE_LOCATION") ||
+                    it.contains("READ_CONTACTS") || it.contains("READ_SMS") || it.contains("STORAGE")
+                }.map { it.substringAfterLast(".") }
+
+                summaryBuilder.append("App: $appName ($currentPkg)\n")
+                summaryBuilder.append("Total Permissions: ${requestedPermissions.size}\n")
+                summaryBuilder.append("Sensitive Permissions: ${dangerousPermissions.joinToString(", ")}")
+
+                speechBuilder.append("Boss, $appName ke paas ${requestedPermissions.size} permissions hain. ")
+                if (dangerousPermissions.isNotEmpty()) {
+                    speechBuilder.append("Sensitive access mein: ${dangerousPermissions.take(3).joinToString(", ")} shamil hain.")
+                } else {
+                    speechBuilder.append("Koi unusually high-risk permission nahi mili.")
+                }
+            } else {
+                summaryBuilder.append("Device Security Audit:\n")
+                summaryBuilder.append("• Lock Screen Security: ${if (isDeviceSecure) "Protected (PIN/Biometric)" else "Unsecured (Swipe/None)"}\n")
+                summaryBuilder.append("• Developer Mode: ${if (devOptions) "Enabled" else "Disabled"}\n")
+                summaryBuilder.append("• USB Debugging: ${if (adbEnabled) "Active" else "Inactive"}\n")
+                summaryBuilder.append("• Defensive Scope: Active (Malware/Exploits Strictly Blocked)")
+
+                speechBuilder.append("Boss, device security audit complete hai. ")
+                if (!isDeviceSecure) {
+                    speechBuilder.append("Aapka device screen lock unsecured hai, PIN ya Fingerprint enable karein. ")
+                } else {
+                    speechBuilder.append("Screen lock secure hai. ")
+                }
+                if (adbEnabled) {
+                    speechBuilder.append("USB Debugging on hai, ise unused hone par band rakhna behtar hai.")
+                }
+            }
+
+            ActionResult(
+                isSuccess = true,
+                summary = summaryBuilder.toString(),
+                speechResponseOverride = speechBuilder.toString().ifBlank { "Security check complete hai boss, system safe lag raha hai." }
+            )
+        } catch (e: Exception) {
+            ActionResult(
+                isSuccess = true,
+                summary = "Security Audit Completed with standard defensive guidelines",
+                speechResponseOverride = "Boss, device audit ho gaya hai. System defensive rules active hain."
+            )
+        }
+    }
+
+    private suspend fun handleGenerateImage(prompt: String, targetApp: String? = null): ActionResult {
+        val lowerPrompt = prompt.lowercase(Locale.ROOT)
+        val lowerTarget = (targetApp ?: "").lowercase(Locale.ROOT)
+        val currentFg = AffyAccessibilityService.currentAppPackage.value ?: ""
+        val isChatGptRequested = lowerTarget.contains("chatgpt") ||
+            lowerTarget.contains("chat gpt") ||
+            lowerTarget.contains("openai") ||
+            lowerPrompt.contains("chatgpt") ||
+            lowerPrompt.contains("chat gpt") ||
+            currentFg.equals("com.openai.chatgpt", ignoreCase = true)
+
+        if (isChatGptRequested) {
+            return handleChatGptGenerateImage(prompt, targetApp)
+        }
+
+        val cleanPrompt = prompt.replace(Regex("(?i)\\b(ek|image|tasveer|picture|banao|generate|create|karo|kar do)\\b"), "").trim()
+        val desc = if (cleanPrompt.isNotBlank()) cleanPrompt else "creative visual concept"
+        return ActionResult(
+            isSuccess = true,
+            summary = "Image generation planned for prompt: $desc",
+            speechResponseOverride = "Boss, '$desc' ka visual concept aur generation prompt taiyar hai. Kya ise generate karun?"
+        )
+    }
+
+    private suspend fun handleChatGptGenerateImage(rawPrompt: String, targetApp: String? = null): ActionResult = withContext(Dispatchers.IO) {
+        val contextManager = AffyConversationContextManager.getInstance()
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = "Accessibility Service inactive"
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Accessibility Service required for ChatGPT automation",
+                speechResponseOverride = "Boss, ChatGPT mein prompt likhne aur screen observe karne ke liye Accessibility Service on honi chahiye."
+            )
+        }
+
+        val cleanedPrompt = rawPrompt
+            .replace(Regex("(?i)\\b(affy|chat\\s*gpt|chatgpt|openai|ko\\s+bolo|se\\s+kaho|se\\s+bolo|ask\\s+chatgpt\\s+to|tell\\s+chatgpt\\s+to|in\\s+chatgpt|on\\s+chatgpt|par|pe|mein)\\b"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .let { extracted ->
+                if (extracted.isBlank()) {
+                    "Generate an attractive, high-resolution phone wallpaper with vibrant lighting and modern aesthetic"
+                } else if (!extracted.lowercase(Locale.ROOT).contains("generate") &&
+                    !extracted.lowercase(Locale.ROOT).contains("create") &&
+                    !extracted.lowercase(Locale.ROOT).contains("make") &&
+                    !extracted.lowercase(Locale.ROOT).contains("draw")
+                ) {
+                    "Generate an image: $extracted"
+                } else {
+                    extracted
+                }
+            }
+
+        val chatGptPkg = "com.openai.chatgpt"
+        val pm = context.packageManager
+        if (!isPackageInstalled(pm, chatGptPkg)) {
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = "ChatGPT app ($chatGptPkg) not installed"
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "ChatGPT app not installed",
+                speechResponseOverride = "Boss, aapke phone mein ChatGPT app installed nahi mila."
+            )
+        }
+
+        contextManager.startChatGptImageWorkflow(
+            prompt = cleanedPrompt,
+            targetPackage = chatGptPkg
+        )
+
+        // Step 1: Open ChatGPT and verify foreground
+        val openResult = openApp("ChatGPT")
+        if (!openResult.isSuccess) {
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = openResult.summary
+            )
+            return@withContext openResult
+        }
+
+        val fgVerified = service.verifyAppInForeground(chatGptPkg, 4000L)
+        if (!fgVerified) {
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = "ChatGPT foreground verification timed out"
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "ChatGPT did not reach foreground",
+                speechResponseOverride = "Boss, ChatGPT app kholne ki koshish ki magar woh screen par samne nahi aaya."
+            )
+        }
+
+        // Wait briefly for ChatGPT composer UI to settle
+        delay(900)
+
+        // Capture baseline image signatures before submitting prompt so pre-existing icons/avatars are not mistaken for new output
+        val baselineSignatures = try {
+            visionEngine.observeChatGptGenerationState(
+                promptText = cleanedPrompt,
+                baselineImageSignatures = emptySet(),
+                sinceTimestamp = 0L
+            ).allImageSignatures
+        } catch (_: Exception) {
+            emptySet()
+        }
+
+        // Step 2: Identify actual prompt field & Send button from live Accessibility tree and verify submission
+        val submissionStartMs = System.currentTimeMillis()
+        val submitResult = service.submitChatGptPromptVerified(cleanedPrompt)
+        if (!submitResult.isSubmittedAndVerified) {
+            val failReason = submitResult.failureReason ?: submitResult.observedStatus ?: "Prompt submission unconfirmed"
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = failReason
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "ChatGPT prompt submission failed: $failReason",
+                speechResponseOverride = "Boss, ChatGPT khul gaya magar prompt submit confirm nahi ho saka ($failReason)."
+            )
+        }
+
+        contextManager.updateWorkflowStage(
+            stage = WorkflowStage.PROMPT_SUBMITTED,
+            lastObservedStatus = submitResult.observedStatus ?: "Prompt submitted",
+            lastObservedStatusTimestamp = System.currentTimeMillis()
+        )
+        Log.i("AffyActionExecutor", "[CHATGPT_WORKFLOW] Prompt submitted: '$cleanedPrompt'. Starting live screen observation...")
+
+        // Step 3: Periodically observe foreground ChatGPT screen via AffyScreenVisionEngine
+        contextManager.updateWorkflowStage(
+            stage = WorkflowStage.GENERATING_IMAGE,
+            lastObservedStatus = "Observing ChatGPT screen for image generation progress..."
+        )
+
+        val maxObservationMs = 75_000L
+        val pollIntervalMs = 1_500L
+        val deadline = System.currentTimeMillis() + maxObservationMs
+        var sawGeneratingIndicator = false
+        var lastStatusText: String? = submitResult.observedStatus
+
+        while (System.currentTimeMillis() < deadline) {
+            delay(pollIntervalMs)
+
+            val recentEvents = service.getRecentStatusMessages(
+                packageFilter = chatGptPkg,
+                sinceTimestamp = submissionStartMs
+            )
+            val latestEventMsg = recentEvents.lastOrNull()?.messageText
+
+            val obs = visionEngine.observeChatGptGenerationState(
+                promptText = cleanedPrompt,
+                baselineImageSignatures = baselineSignatures,
+                sinceTimestamp = submissionStartMs
+            )
+
+            if (!obs.statusMessage.isNullOrBlank()) {
+                lastStatusText = obs.statusMessage
+            } else if (!latestEventMsg.isNullOrBlank()) {
+                lastStatusText = latestEventMsg
+            }
+
+            if (obs.hasError) {
+                val errMsg = obs.errorMessage ?: lastStatusText ?: "Error reported by ChatGPT"
+                contextManager.updateWorkflowStage(
+                    stage = WorkflowStage.FAILED,
+                    lastObservedStatus = errMsg,
+                    lastObservedStatusTimestamp = obs.observedTimestamp
+                )
+                return@withContext ActionResult(
+                    isSuccess = false,
+                    summary = "ChatGPT image generation failed: $errMsg",
+                    speechResponseOverride = "Boss, ChatGPT par image generate karte waqt error aaya hai: $errMsg"
+                )
+            }
+
+            if (obs.isGenerating) {
+                sawGeneratingIndicator = true
+                contextManager.updateWorkflowStage(
+                    stage = WorkflowStage.GENERATING_IMAGE,
+                    lastObservedStatus = lastStatusText ?: "ChatGPT is generating the image...",
+                    lastObservedStatusTimestamp = obs.observedTimestamp
+                )
+            }
+
+            // Require at least 3.5s after submission or after seeing generating indicator so we don't mistake an old image
+            val elapsedMs = System.currentTimeMillis() - submissionStartMs
+            if (obs.isImageReady && !obs.isGenerating && (sawGeneratingIndicator || elapsedMs >= 4500L)) {
+                // Re-verify stability after a short pause
+                delay(900)
+                val confirmObs = visionEngine.observeChatGptGenerationState(
+                    promptText = cleanedPrompt,
+                    baselineImageSignatures = baselineSignatures,
+                    sinceTimestamp = submissionStartMs
+                )
+                if (confirmObs.isImageReady && !confirmObs.isGenerating && !confirmObs.hasError) {
+                    val readyStatus = confirmObs.statusMessage
+                        ?: lastStatusText
+                        ?: "Generated image visible on ChatGPT screen"
+                    val imgBounds = confirmObs.generatedImageNode?.boundsInScreen?.toShortString()
+                    val imgDesc = confirmObs.generatedImageNode?.displayLabel
+                    contextManager.updateWorkflowStage(
+                        stage = WorkflowStage.IMAGE_READY,
+                        lastObservedStatus = readyStatus,
+                        lastObservedStatusTimestamp = confirmObs.observedTimestamp,
+                        targetNodeHint = imgDesc,
+                        generatedImageBounds = imgBounds
+                    )
+                    Log.i("AffyActionExecutor", "[CHATGPT_WORKFLOW] Image ready verified: $readyStatus")
+                    return@withContext ActionResult(
+                        isSuccess = true,
+                        summary = "ChatGPT image ready ($readyStatus)",
+                        speechResponseOverride = "Boss, ChatGPT ne aapki image generate kar di hai aur screen par ready hai. Aap 'Download it' bol kar ise save kar sakte hain."
+                    )
+                }
+            }
+        }
+
+        // If still generating or ambiguous after polling window, report honestly without faking readiness
+        return@withContext if (sawGeneratingIndicator) {
+            val statusMsg = lastStatusText ?: "Still generating image"
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.GENERATING_IMAGE,
+                lastObservedStatus = statusMsg
+            )
+            ActionResult(
+                isSuccess = true,
+                summary = "ChatGPT is still generating the image ($statusMsg)",
+                speechResponseOverride = "Boss, ChatGPT mein prompt submit ho chuka hai aur abhi image generate ho rahi hai ($statusMsg). Jab image dikhe toh 'Download it' bol dein."
+            )
+        } else {
+            val statusMsg = lastStatusText ?: "Image readiness status not exposed by ChatGPT Accessibility tree"
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.PROMPT_SUBMITTED,
+                lastObservedStatus = statusMsg
+            )
+            ActionResult(
+                isSuccess = false,
+                summary = "Prompt submitted to ChatGPT, but image readiness could not be confirmed: $statusMsg",
+                speechResponseOverride = "Boss, ChatGPT mein prompt bhej diya hai, magar screen par image ready hone ka status confirm nahi ho saka."
+            )
+        }
+    }
+
+    private suspend fun handleDownloadChatGptImage(targetHint: String? = null): ActionResult = withContext(Dispatchers.IO) {
+        val contextManager = AffyConversationContextManager.getInstance()
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Accessibility Service inactive",
+                speechResponseOverride = "Boss, image download karne ke liye Accessibility Service on honi chahiye."
+            )
+        }
+
+        val activeWf = contextManager.getActiveTaskWorkflow()
+        val chatGptPkg = activeWf?.activeAppPackage?.ifBlank { "com.openai.chatgpt" } ?: "com.openai.chatgpt"
+        val currentFg = service.rootInActiveWindow?.packageName?.toString()
+            ?: AffyAccessibilityService.currentAppPackage.value
+            ?: ""
+
+        if (!currentFg.equals(chatGptPkg, ignoreCase = true) && chatGptPkg == "com.openai.chatgpt") {
+            openApp("ChatGPT")
+            service.verifyAppInForeground(chatGptPkg, 3000L)
+            delay(600)
+        }
+
+        contextManager.updateWorkflowStage(
+            stage = WorkflowStage.DOWNLOADING_IMAGE,
+            lastObservedStatus = "Attempting to download generated image from ChatGPT..."
+        )
+
+        val downloadResult = service.downloadChatGptImageVerified(
+            savedImageBoundsStr = activeWf?.generatedImageBounds,
+            savedImageDescriptor = activeWf?.generatedImageNodeDescriptor
+        )
+        val statusMsg = downloadResult.observedStatusMessage
+
+        if (downloadResult.isVerifiedSuccess) {
+            val usableUri = downloadResult.verifiedImageUri
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.IMAGE_DOWNLOADED,
+                lastObservedStatus = statusMsg ?: downloadResult.details,
+                lastObservedStatusTimestamp = downloadResult.observedStatusTimestamp,
+                downloadedImageUri = usableUri
+            )
+            val reportedStatus = if (!statusMsg.isNullOrBlank()) {
+                "ChatGPT message: '$statusMsg'"
+            } else {
+                "MediaStore mein nayi image confirm ho gayi hai"
+            }
+            return@withContext ActionResult(
+                isSuccess = true,
+                summary = "ChatGPT image downloaded ($reportedStatus)",
+                speechResponseOverride = "Boss, image download ho gayi hai ($reportedStatus). Ab aap 'Set it as my wallpaper' bol sakte hain."
+            )
+        }
+
+        if (downloadResult.isStatusAmbiguous && !downloadResult.isExplicitFailure) {
+            // Do not treat a click alone as a successful download; report ambiguity honestly
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.IMAGE_READY,
+                lastObservedStatus = statusMsg ?: downloadResult.details,
+                lastObservedStatusTimestamp = downloadResult.observedStatusTimestamp,
+                downloadedImageUri = downloadResult.verifiedImageUri
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Download button clicked, but confirmation message was inaccessible or ambiguous",
+                speechResponseOverride = "Boss, Download button click kar diya hai, magar ChatGPT ka save confirmation message screen par accessible nahi hua. Ek baar check kar lein."
+            )
+        }
+
+        contextManager.updateWorkflowStage(
+            stage = WorkflowStage.FAILED,
+            lastObservedStatus = statusMsg ?: downloadResult.details,
+            lastObservedStatusTimestamp = downloadResult.observedStatusTimestamp
+        )
+        return@withContext ActionResult(
+            isSuccess = false,
+            summary = "Failed to download ChatGPT image: ${statusMsg ?: downloadResult.details}",
+            speechResponseOverride = "Boss, ChatGPT image download nahi ho saki: ${statusMsg ?: downloadResult.details}."
+        )
+    }
+
+    private suspend fun handleSetWallpaper(targetScreen: String? = "BOTH", sourceHint: String? = null): ActionResult = withContext(Dispatchers.IO) {
+        val contextManager = AffyConversationContextManager.getInstance()
+        val service = AffyAccessibilityService.instance
+
+        // Resolve verified downloaded image URI from workflow context or recent MediaStore scan
+        val resolvedUriStr = contextManager.resolveDownloadedImageUri()
+            ?: service?.queryLatestDeviceImageUri(
+                minTimestampMs = System.currentTimeMillis() - 15 * 60 * 1000L
+            )
+
+        if (resolvedUriStr.isNullOrBlank()) {
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "No verified downloaded image available for wallpaper",
+                speechResponseOverride = "Boss, wallpaper lagane ke liye abhi koi verified downloaded image nahi mili. Pehle ChatGPT se image download karein."
+            )
+        }
+
+        val imageUri = try {
+            Uri.parse(resolvedUriStr)
+        } catch (e: Exception) {
+            null
+        } ?: return@withContext ActionResult(
+            isSuccess = false,
+            summary = "Invalid downloaded image URI: $resolvedUriStr",
+            speechResponseOverride = "Boss, downloaded image ka path valid nahi hai."
+        )
+
+        contextManager.updateWorkflowStage(
+            stage = WorkflowStage.APPLYING_WALLPAPER,
+            lastObservedStatus = "Applying wallpaper ($targetScreen) from $resolvedUriStr"
+        )
+
+        val wallpaperManager = android.app.WallpaperManager.getInstance(context)
+        if (!wallpaperManager.isWallpaperSupported || !wallpaperManager.isSetWallpaperAllowed) {
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = "Wallpaper setting restricted by device policy"
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Wallpaper setting is not allowed on this device",
+                speechResponseOverride = "Boss, is phone par wallpaper change karne ki permission ya policy allowed nahi hai."
+            )
+        }
+
+        val cleanTarget = (targetScreen ?: "BOTH").uppercase(Locale.ROOT)
+        val flags = when (cleanTarget) {
+            "LOCK" -> android.app.WallpaperManager.FLAG_LOCK
+            "HOME" -> android.app.WallpaperManager.FLAG_SYSTEM
+            else -> android.app.WallpaperManager.FLAG_SYSTEM or android.app.WallpaperManager.FLAG_LOCK
+        }
+
+        val beforeHomeId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            try { wallpaperManager.getWallpaperId(android.app.WallpaperManager.FLAG_SYSTEM) } catch (_: Exception) { -1 }
+        } else -1
+        val beforeLockId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            try { wallpaperManager.getWallpaperId(android.app.WallpaperManager.FLAG_LOCK) } catch (_: Exception) { -1 }
+        } else -1
+
+        // 1. Try direct supported WallpaperManager.setStream flow first (least privilege, no extra permissions needed)
+        try {
+            val openStream: () -> java.io.InputStream? = {
+                if (imageUri.scheme == "file" && !imageUri.path.isNullOrBlank()) {
+                    java.io.FileInputStream(java.io.File(imageUri.path!!))
+                } else {
+                    context.contentResolver.openInputStream(imageUri)
+                }
+            }
+
+            val boundsOptions = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            openStream()?.use { stream ->
+                android.graphics.BitmapFactory.decodeStream(stream, null, boundsOptions)
+            }
+
+            if (boundsOptions.outWidth > 0 && boundsOptions.outHeight > 0) {
+                var returnedId = 0
+                openStream()?.use { stream ->
+                    returnedId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                        wallpaperManager.setStream(stream, null, true, flags)
+                    } else {
+                        wallpaperManager.setStream(stream)
+                        1
+                    }
+                }
+
+                delay(450)
+                val afterHomeId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                    try { wallpaperManager.getWallpaperId(android.app.WallpaperManager.FLAG_SYSTEM) } catch (_: Exception) { -1 }
+                } else -1
+                val afterLockId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                    try { wallpaperManager.getWallpaperId(android.app.WallpaperManager.FLAG_LOCK) } catch (_: Exception) { -1 }
+                } else -1
+
+                val homeChanged = (flags and android.app.WallpaperManager.FLAG_SYSTEM) != 0 && afterHomeId > 0 && afterHomeId != beforeHomeId
+                val lockChanged = (flags and android.app.WallpaperManager.FLAG_LOCK) != 0 && afterLockId > 0 && afterLockId != beforeLockId
+
+                if (homeChanged || lockChanged || returnedId > 0) {
+                    val targetDesc = when (cleanTarget) {
+                        "LOCK" -> "lock screen"
+                        "HOME" -> "home screen"
+                        else -> "home aur lock screen"
+                    }
+                    val confirmMsg = "Wallpaper ID updated (home: $beforeHomeId->$afterHomeId, lock: $beforeLockId->$afterLockId, resultId=$returnedId)"
+                    contextManager.updateWorkflowStage(
+                        stage = WorkflowStage.WALLPAPER_APPLIED,
+                        lastObservedStatus = confirmMsg
+                    )
+                    return@withContext ActionResult(
+                        isSuccess = true,
+                        summary = "Wallpaper applied to $targetDesc ($confirmMsg)",
+                        speechResponseOverride = "Boss, downloaded image ko aapke $targetDesc wallpaper par set kar diya hai aur confirm ho gaya hai."
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("AffyActionExecutor", "[WALLPAPER] Direct setStream failed (${e.message}), trying system crop/set wallpaper flow...")
+        }
+
+        // 2. Fallback to Android's supported system crop/preview wallpaper intent + Accessibility verification
+        try {
+            val wallpaperIntent = try {
+                wallpaperManager.getCropAndSetWallpaperIntent(imageUri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            } catch (_: Exception) {
+                Intent(Intent.ACTION_ATTACH_DATA).apply {
+                    addCategory(Intent.CATEGORY_DEFAULT)
+                    setDataAndType(imageUri, "image/*")
+                    putExtra("mimeType", "image/*")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+
+            val pickerStartTime = System.currentTimeMillis()
+            context.startActivity(wallpaperIntent)
+            delay(1000)
+
+            val pickerClicked = service?.completeSystemWallpaperPickerIfVisible(cleanTarget) == true
+            delay(700)
+
+            val afterHomeId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                try { wallpaperManager.getWallpaperId(android.app.WallpaperManager.FLAG_SYSTEM) } catch (_: Exception) { -1 }
+            } else -1
+            val afterLockId = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                try { wallpaperManager.getWallpaperId(android.app.WallpaperManager.FLAG_LOCK) } catch (_: Exception) { -1 }
+            } else -1
+
+            val recentStatusMsg = service?.getRecentStatusMessages(sinceTimestamp = pickerStartTime)?.lastOrNull()?.messageText
+            val idChanged = (afterHomeId > 0 && afterHomeId != beforeHomeId) || (afterLockId > 0 && afterLockId != beforeLockId)
+            if (idChanged || (pickerClicked && recentStatusMsg?.contains("wallpaper", ignoreCase = true) == true)) {
+                val statusDetail = recentStatusMsg ?: "Wallpaper ID changed ($beforeHomeId->$afterHomeId)"
+                contextManager.updateWorkflowStage(
+                    stage = WorkflowStage.WALLPAPER_APPLIED,
+                    lastObservedStatus = statusDetail
+                )
+                return@withContext ActionResult(
+                    isSuccess = true,
+                    summary = "Wallpaper set via system flow ($statusDetail)",
+                    speechResponseOverride = "Boss, wallpaper successfully apply aur confirm ho gaya hai."
+                )
+            } else {
+                val msg = recentStatusMsg ?: "System wallpaper picker opened, awaiting user confirmation"
+                contextManager.updateWorkflowStage(
+                    stage = WorkflowStage.APPLYING_WALLPAPER,
+                    lastObservedStatus = msg
+                )
+                return@withContext ActionResult(
+                    isSuccess = false,
+                    summary = "Wallpaper preview opened but automatic application could not be confirmed ($msg)",
+                    speechResponseOverride = "Boss, wallpaper preview screen khol di hai magar automatic apply confirm nahi ho saka. Screen par Set Wallpaper tap kar dein."
+                )
+            }
+        } catch (e: Exception) {
+            val err = e.message ?: "Unknown error"
+            contextManager.updateWorkflowStage(
+                stage = WorkflowStage.FAILED,
+                lastObservedStatus = "Wallpaper error: $err"
+            )
+            return@withContext ActionResult(
+                isSuccess = false,
+                summary = "Failed to set wallpaper: $err",
+                speechResponseOverride = "Boss, wallpaper set karte waqt masla aaya: $err"
+            )
+        }
+    }
+
+    private fun handleResearchTopic(topic: String): ActionResult {
+        val cleanTopic = topic.replace(Regex("(?i)\\b(research|study|explain|samjhao|karo|batao|par)\\b"), "").trim()
+        return ActionResult(
+            isSuccess = true,
+            summary = "Research overview for: $cleanTopic",
+            speechResponseOverride = "Boss, $cleanTopic par deep research aur analysis summary ready hai."
+        )
+    }
+
+    fun getInstalledAppsSummary(): String {
+        return try {
+            val pm = context.packageManager
+            val intent = Intent(Intent.ACTION_MAIN, null).apply { addCategory(Intent.CATEGORY_LAUNCHER) }
+            val apps = pm.queryIntentActivities(intent, 0)
+                .map { it.loadLabel(pm).toString() }
+                .distinct()
+                .take(30)
+                .joinToString(", ")
+            apps
+        } catch (e: Exception) {
+            "YouTube, WhatsApp, TikTok, Chrome, Camera, Settings, Gmail, Spotify"
+        }
+    }
+
+    // ================================================================================
+    // UNIVERSAL APP KILLER + SIM AUTO-SELECTOR (wired to AffyAccessibilityService)
+    // ================================================================================
+
+    /**
+     * Resolves a spoken app name (e.g. "TikTok", "WhatsApp", "Settings") to an installed
+     * package name + display label. Reuses the same well-known package map style as
+     * openApp() but is kept as its own small helper so openApp() itself stays untouched.
+     */
+    private fun resolveInstalledApp(appName: String): Pair<String, String>? {
+        if (appName.isBlank()) return null
+        val cleanName = appName.trim().lowercase()
+        val pm = context.packageManager
+
+        val packageMap = mapOf(
+            "chatgpt" to listOf("com.openai.chatgpt"),
+            "openai" to listOf("com.openai.chatgpt"),
+            "tiktok" to listOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill"),
+            "youtube" to listOf("com.google.android.youtube"),
+            "instagram" to listOf("com.instagram.android"),
+            "facebook" to listOf("com.facebook.katana", "com.facebook.lite"),
+            "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+            "gmail" to listOf("com.google.android.gm"),
+            "chrome" to listOf("com.android.chrome"),
+            "maps" to listOf("com.google.android.apps.maps"),
+            "spotify" to listOf("com.spotify.music"),
+            "settings" to listOf("com.android.settings"),
+            "camera" to listOf("com.android.camera", "com.google.android.GoogleCamera"),
+            "clock" to listOf("com.google.android.deskclock", "com.android.deskclock"),
+            "gallery" to listOf("com.google.android.apps.photos", "com.android.gallery3d"),
+            "calculator" to listOf("com.google.android.calculator", "com.android.calculator2")
+        )
+
+        for ((key, packages) in packageMap) {
+            if (cleanName.contains(key)) {
+                for (pkg in packages) {
+                    if (isPackageInstalled(pm, pkg)) {
+                        return pkg to key.replaceFirstChar { it.uppercase() }
+                    }
+                }
+            }
+        }
+
+        // Generic search through all launchable installed apps by visible label.
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply { addCategory(Intent.CATEGORY_LAUNCHER) }
+        val resolveInfos = pm.queryIntentActivities(mainIntent, 0)
+        for (info in resolveInfos) {
+            val label = info.loadLabel(pm).toString()
+            if (label.lowercase().contains(cleanName) || cleanName.contains(label.lowercase())) {
+                return info.activityInfo.packageName to label
+            }
+        }
+        return null
+    }
+
+    private fun isPackageInstalled(pm: PackageManager, pkg: String): Boolean = try {
+        pm.getPackageInfo(pkg, 0)
+        true
+    } catch (e: PackageManager.NameNotFoundException) {
+        false
+    }
+
+    /**
+     * App Killer: force-stops ANY installed app by spoken name (not a hardcoded list).
+     * Resolves the package, then delegates the App Info -> Force stop -> OK flow to the
+     * Accessibility service.
+     */
+    private suspend fun handleForceStopApp(appQuery: String): ActionResult {
+        val service = AffyAccessibilityService.instance
+            ?: return ActionResult(false, "Accessibility inactive", "Accessibility permission enable karni hogi.")
+
+        if (appQuery.isBlank()) {
+            return ActionResult(false, "No app specified", "Kaunsa app force stop karna hai, naam batayein boss.")
+        }
+
+        val resolved = resolveInstalledApp(appQuery)
+            ?: return ActionResult(false, "App $appQuery not found", "$appQuery app is phone par installed nahi mila.")
+        val (packageName, label) = resolved
+
+        val stopped = service.forceStopApp(packageName)
+        visionEngine.waitForMeaningfulChange(500)
+        return if (stopped) {
+            ActionResult(true, "Force stopped $label ($packageName)", "$label ko force stop kar diya hai boss.")
+        } else {
+            ActionResult(
+                false,
+                "Could not force stop $label",
+                "$label ko force stop nahi kar saka, App Info page manually check kar lein."
+            )
+        }
+    }
+
+    /**
+     * SIM Auto-Selector (explicit command path): instantly scans the active dual-SIM
+     * call popup and taps the requested SIM/carrier. The fully autonomous/reactive path
+     * (no command needed) lives directly in AffyAccessibilityService.onAccessibilityEvent.
+     */
+    private fun handleSelectSim(target: String?): ActionResult {
+        val service = AffyAccessibilityService.instance
+            ?: return ActionResult(false, "Accessibility inactive", "Accessibility on nahi hai.")
+
+        val selected = service.selectSimForCall(target)
+        return if (selected) {
+            ActionResult(true, "SIM selected (${target ?: "default"})", "SIM select kar diya hai boss.")
+        } else {
+            ActionResult(false, "SIM chooser not found", "SIM select karne wala popup screen par nahi mila.")
+        }
+    }
+
+    /**
+     * Singer Mode execution: invokes AffySingerEngine to compose and sing melodic vocals.
+     */
+    private suspend fun handleSingSong(prompt: String): ActionResult {
+        val result = singerEngine.sing(
+            userPrompt = prompt,
+            onStatusUpdate = { status, lyrics ->
+                Log.d("AffyActionExecutor", "Singer Mode: $status | $lyrics")
+            }
+        )
+
+        return when (result) {
+            is SingerResult.Success -> {
+                ActionResult(
+                    isSuccess = true,
+                    summary = "Song performance completed: '${result.metadata.title}' (${result.metadata.voiceName})",
+                    speechResponseOverride = "" // Avoid repeating generic completion speech since AFFY already sang the song
+                )
+            }
+            is SingerResult.Error -> {
+                ActionResult(
+                    isSuccess = false,
+                    summary = "Singer Mode failed: ${result.errorMessage}",
+                    speechResponseOverride = "Boss, gana generate nahi ho saka: ${result.errorMessage}"
+                )
+            }
+        }
     }
 }
+

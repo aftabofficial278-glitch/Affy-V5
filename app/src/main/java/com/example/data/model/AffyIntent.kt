@@ -131,4 +131,5 @@ object ActionTypes {
     const val OPEN_COMMENTS = "OPEN_COMMENTS"
     const val UNIVERSAL_SEARCH = "UNIVERSAL_SEARCH"
     const val SELECT_VIDEO_RESULT = "SELECT_VIDEO_RESULT"
+    const val OPEN_CHAT = "OPEN_CHAT"
 }
