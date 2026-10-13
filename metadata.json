@@ -1,7 +1,6 @@
 {
-  "name": "AFFY",
-  "description": "Personal AI Android Assistant with voice interaction, Gemini intelligence, and legitimate phone automation.",
+  "name": "AFFY 2.5",
+  "description": "Autonomous voice & accessibility AI agent for Android",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
-

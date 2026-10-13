@@ -210,15 +210,8 @@ fun AffyMainScreen(
             .background(Color(0xFF04060C)),
         contentAlignment = Alignment.Center
     ) {
-        // 1. FULL-SCREEN DEEP-SPACE GOLDEN UNIVERSE ENVIRONMENT (Edge-to-Edge)
+        // 1. FULL-SCREEN HOLOGRAPHIC CHAIR PRESENCE (Edge-to-Edge)
         AffyHologramPresence(
-            state = uiState.state,
-            amplitude = uiState.audioAmplitude,
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // 2. FULL-SCREEN MULTI-LAYERED 3D DIMENSIONAL ENERGY MECHANISM & WAVES (Edge-to-Edge)
-        AffyAiCoreOrb(
             state = uiState.state,
             amplitude = uiState.audioAmplitude,
             modifier = Modifier.fillMaxSize(),

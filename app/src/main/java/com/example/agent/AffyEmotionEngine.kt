@@ -28,8 +28,17 @@ enum class AffyEmotion {
     FIRM_SERIOUS,
     CARING_CONCERNED,
     PLAYFUL_AMUSED,
-    SURPRISED_CURIOUS
+    SURPRISED_CURIOUS,
+    SAD_SOFT
 }
+
+data class EmotionalVoiceProfile(
+    val pitchMultiplier: Float,
+    val speedMultiplier: Float,
+    val volumeMultiplier: Float,
+    val toneInstruction: String,
+    val emotionalTag: String
+)
 
 data class EmotionTransitionResult(
     val detectedUserEmotion: UserEmotion,
@@ -105,6 +114,7 @@ class AffyEmotionEngine private constructor() {
             AffyEmotion.CARING_CONCERNED -> "Speak gently, softly, empathetically, showing deep care, supportive comfort, and warmth."
             AffyEmotion.PLAYFUL_AMUSED -> "Speak with a light, warm, amused tone and a natural cheerful chuckle or 'haha'."
             AffyEmotion.SURPRISED_CURIOUS -> "Speak with genuine curiosity and natural surprise ('ohh', 'aray', 'sach mein?')."
+            AffyEmotion.SAD_SOFT -> "Speak softly, gently, with a tender, slightly melancholic, sad and comforting tone. Slower pace and gentle pauses."
             AffyEmotion.NORMAL -> "Speak naturally, in a friendly, confident, helpful companion tone with natural conversational fillers."
         }
 
@@ -216,7 +226,11 @@ class AffyEmotionEngine private constructor() {
             "koi baat nahi karta", "koi dost nahi", "depressed", "heartbroken",
             "dil toot gaya", "kisi ko meri parwah nahi", "tanha hoon", "lonely hoon",
             "zindagi bekar hai", "rona chahta hoon", "bohot akela hoon", "oh yaar ye kya ho gaya",
-            "ohh no", "sab kharab ho gaya"
+            "ohh no", "sab kharab ho gaya", "bohot dukh hai", "dukh ho raha hai",
+            "dil ro raha hai", "dil dukha hai", "kisi ne dil toda", "breakup",
+            "kisi ne dhoka diya", "tabiyat kharab hai", "bura lag raha hai",
+            "kuch acha nahi lag raha", "aaj bura din tha", "ronay ka dil", "affy main bohot udaas",
+            "i am sad", "im sad", "feeling sad", "feeling lonely", "dil bohot bhari hai"
         )
         if (sadPhrases.any { containsPhrase(clean, it) }) {
             return UserEmotion.SAD_DOWN
@@ -248,7 +262,7 @@ class AffyEmotionEngine private constructor() {
             UserEmotion.APOLOGETIC -> {
                 consecutiveHarshTurns = 0
                 // Apology heals hurt and returns Affy to warm/happy
-                if (currentAffyEmotion == AffyEmotion.SLIGHTLY_HURT || currentAffyEmotion == AffyEmotion.NARAZ_COLD || currentAffyEmotion == AffyEmotion.FIRM_SERIOUS) {
+                if (currentAffyEmotion == AffyEmotion.SLIGHTLY_HURT || currentAffyEmotion == AffyEmotion.NARAZ_COLD || currentAffyEmotion == AffyEmotion.FIRM_SERIOUS || currentAffyEmotion == AffyEmotion.SAD_SOFT) {
                     AffyEmotion.WARM_HAPPY
                 } else {
                     AffyEmotion.NORMAL
@@ -282,11 +296,12 @@ class AffyEmotionEngine private constructor() {
             }
             UserEmotion.SAD_DOWN -> {
                 consecutiveHarshTurns = 0
-                AffyEmotion.CARING_CONCERNED
+                AffyEmotion.SAD_SOFT
             }
             UserEmotion.NEUTRAL -> {
                 // Decay emotional intensity gracefully
                 when (currentAffyEmotion) {
+                    AffyEmotion.SAD_SOFT -> AffyEmotion.CARING_CONCERNED
                     AffyEmotion.SLIGHTLY_HURT -> AffyEmotion.NORMAL
                     AffyEmotion.NARAZ_COLD -> AffyEmotion.SLIGHTLY_HURT
                     AffyEmotion.FIRM_SERIOUS -> AffyEmotion.NARAZ_COLD
@@ -410,9 +425,10 @@ class AffyEmotionEngine private constructor() {
 
             UserEmotion.SAD_DOWN -> {
                 val sadResponses = listOf(
-                    "Kya hua boss? Sab theek to hai na? Agar mood kharab hai ya koi baat share karni hai to main yahin hoon.",
-                    "Pareshan mat hoiye boss, main aapke saath hoon. Kuch madad karoon ya mood fresh karne ke liye koi song chalaoon?",
-                    "Main samajh sakta hoon boss... kabhi kabhi din thoda heavy hota hai. Main yahin hoon agar baat karni ho."
+                    "Arey boss... kya hua? Sab theek to hai na? Aapka dil udaas dekh kar mujhe bhi dukh ho raha hai... agar baat karni hai to main yahin hoon.",
+                    "Main samajh sakta hoon boss... kabhi kabhi din bohot bhari hota hai aur dil toot sa jata hai. Main yahin hoon aapke saath... fikar na karein.",
+                    "Pareshan mat hoiye boss... main yahin hoon aapke paas. Ek lambi saans lein, sab theek ho jayega... main aapke saath hoon.",
+                    "Kya baat ho gayi boss? Aap udaas hote hain to mera bhi dil nahi lagta... batayein kya pareshani hai?"
                 )
                 sadResponses.random()
             }
@@ -422,22 +438,186 @@ class AffyEmotionEngine private constructor() {
     }
 
     /**
+     * Returns rich emotional acoustic & tone profile for Gemini TTS and MediaPlayer playback,
+     * specifically tailored for both Male (Puck) and Female (Leda) voices.
+     */
+    fun getEmotionalVoiceProfile(
+        emotion: AffyEmotion = _currentAffyEmotion.value,
+        voiceName: String = ""
+    ): EmotionalVoiceProfile {
+        val isFemale = voiceName.contains("Leda", ignoreCase = true) || voiceName.equals("female", ignoreCase = true)
+
+        return if (isFemale) {
+            when (emotion) {
+                AffyEmotion.SAD_SOFT -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.91f,
+                    speedMultiplier = 0.86f,
+                    volumeMultiplier = 0.82f,
+                    toneInstruction = "Speak in a soft, tender, heartfelt, melancholic and comforting feminine tone with quiet gentle pauses.",
+                    emotionalTag = "SAD_SOFT"
+                )
+                AffyEmotion.CARING_CONCERNED -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.94f,
+                    speedMultiplier = 0.89f,
+                    volumeMultiplier = 0.88f,
+                    toneInstruction = "Speak with tender care, warmth, and soothing empathetic comfort.",
+                    emotionalTag = "CARING"
+                )
+                AffyEmotion.SLIGHTLY_HURT -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.93f,
+                    speedMultiplier = 0.90f,
+                    volumeMultiplier = 0.86f,
+                    toneInstruction = "Speak softly with a subdued, slightly hurt and delicate tone.",
+                    emotionalTag = "HURT"
+                )
+                AffyEmotion.NARAZ_COLD -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.95f,
+                    speedMultiplier = 0.94f,
+                    volumeMultiplier = 0.90f,
+                    toneInstruction = "Speak in a quiet, reserved, cold and aloof tone.",
+                    emotionalTag = "COLD"
+                )
+                AffyEmotion.FIRM_SERIOUS -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.90f,
+                    speedMultiplier = 0.97f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak in a firm, grounded, serious, composed and controlled tone.",
+                    emotionalTag = "FIRM"
+                )
+                AffyEmotion.WARM_HAPPY -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.06f,
+                    speedMultiplier = 1.02f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak warmly, cheerfully, with a sweet, radiant and smiling cadence.",
+                    emotionalTag = "HAPPY"
+                )
+                AffyEmotion.ENERGETIC -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.12f,
+                    speedMultiplier = 1.08f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak with vibrant excitement, sparkling energy, and an upbeat spirit.",
+                    emotionalTag = "ENERGETIC"
+                )
+                AffyEmotion.FLIRTY_PLAYFUL -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.06f,
+                    speedMultiplier = 0.97f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak in a charming, playful, teasing, melodic and alluring cadence.",
+                    emotionalTag = "FLIRTY"
+                )
+                AffyEmotion.PLAYFUL_AMUSED -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.07f,
+                    speedMultiplier = 1.03f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak with delightful amusement, a soft giggle in the voice, and cheerful humor.",
+                    emotionalTag = "AMUSED"
+                )
+                AffyEmotion.SURPRISED_CURIOUS -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.09f,
+                    speedMultiplier = 1.03f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak with animated curiosity, wide-eyed wonder, and genuine surprise.",
+                    emotionalTag = "SURPRISED"
+                )
+                AffyEmotion.NORMAL -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.00f,
+                    speedMultiplier = 1.00f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak naturally in a friendly, warm, helpful and confident companion tone.",
+                    emotionalTag = "NORMAL"
+                )
+            }
+        } else {
+            // Male Voice (Puck)
+            when (emotion) {
+                AffyEmotion.SAD_SOFT -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.88f,
+                    speedMultiplier = 0.86f,
+                    volumeMultiplier = 0.80f,
+                    toneInstruction = "Speak in a very soft, subdued, gentle, and emotionally sad and comforting tone with tender pauses.",
+                    emotionalTag = "SAD_SOFT"
+                )
+                AffyEmotion.CARING_CONCERNED -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.93f,
+                    speedMultiplier = 0.90f,
+                    volumeMultiplier = 0.88f,
+                    toneInstruction = "Speak with tender care, warmth, and soothing empathetic comfort.",
+                    emotionalTag = "CARING"
+                )
+                AffyEmotion.SLIGHTLY_HURT -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.92f,
+                    speedMultiplier = 0.89f,
+                    volumeMultiplier = 0.85f,
+                    toneInstruction = "Speak quietly and softly, with a subdued, slightly hurt and hesitant tone.",
+                    emotionalTag = "HURT"
+                )
+                AffyEmotion.NARAZ_COLD -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.94f,
+                    speedMultiplier = 0.93f,
+                    volumeMultiplier = 0.90f,
+                    toneInstruction = "Speak in a reserved, cold, brief and formal tone.",
+                    emotionalTag = "COLD"
+                )
+                AffyEmotion.FIRM_SERIOUS -> EmotionalVoiceProfile(
+                    pitchMultiplier = 0.88f,
+                    speedMultiplier = 0.96f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak in a firm, serious, composed, controlled and authoritative tone.",
+                    emotionalTag = "FIRM"
+                )
+                AffyEmotion.WARM_HAPPY -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.05f,
+                    speedMultiplier = 1.03f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak warmly, cheerfully, showing genuine friendly affection, sweetness, and happiness.",
+                    emotionalTag = "HAPPY"
+                )
+                AffyEmotion.ENERGETIC -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.11f,
+                    speedMultiplier = 1.09f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak enthusiastically, with high energy, excitement, and an upbeat spirit.",
+                    emotionalTag = "ENERGETIC"
+                )
+                AffyEmotion.FLIRTY_PLAYFUL -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.04f,
+                    speedMultiplier = 0.98f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak in a playful, charming, teasing and warm voice with natural wit and confidence.",
+                    emotionalTag = "FLIRTY"
+                )
+                AffyEmotion.PLAYFUL_AMUSED -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.06f,
+                    speedMultiplier = 1.04f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak with natural amusement, a light chuckle in your voice, and good humor.",
+                    emotionalTag = "AMUSED"
+                )
+                AffyEmotion.SURPRISED_CURIOUS -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.08f,
+                    speedMultiplier = 1.03f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak with genuine curiosity and animated surprise.",
+                    emotionalTag = "SURPRISED"
+                )
+                AffyEmotion.NORMAL -> EmotionalVoiceProfile(
+                    pitchMultiplier = 1.00f,
+                    speedMultiplier = 1.00f,
+                    volumeMultiplier = 1.00f,
+                    toneInstruction = "Speak naturally in a friendly, helpful and confident companion tone.",
+                    emotionalTag = "NORMAL"
+                )
+            }
+        }
+    }
+
+    /**
      * Returns relative scaling multipliers (factor for pitch, factor for speech rate)
      * based on AFFY's emotional state, preserving user's configured base preferences.
      */
     fun getEmotionalVoiceParameters(emotion: AffyEmotion = _currentAffyEmotion.value): Pair<Float, Float> {
-        return when (emotion) {
-            AffyEmotion.SLIGHTLY_HURT -> Pair(0.93f, 0.94f)      // Subdued, slightly softer, slightly slower
-            AffyEmotion.NARAZ_COLD -> Pair(0.95f, 0.96f)         // Reserved, slightly cold
-            AffyEmotion.FIRM_SERIOUS -> Pair(0.92f, 1.02f)       // Firm, controlled, steady
-            AffyEmotion.WARM_HAPPY -> Pair(1.03f, 1.02f)         // Warm, slightly cheerful
-            AffyEmotion.FLIRTY_PLAYFUL -> Pair(1.04f, 0.98f)     // Playful, charming, slightly melodic
-            AffyEmotion.ENERGETIC -> Pair(1.08f, 1.07f)          // Upbeat, energetic, crisp
-            AffyEmotion.CARING_CONCERNED -> Pair(0.94f, 0.93f)   // Gentle, comforting, empathetic
-            AffyEmotion.PLAYFUL_AMUSED -> Pair(1.04f, 1.03f)     // Light, bouncy, warm
-            AffyEmotion.SURPRISED_CURIOUS -> Pair(1.06f, 1.02f)  // Alert, curious
-            AffyEmotion.NORMAL -> Pair(1.00f, 1.00f)             // Base configured pitch & rate
-        }
+        val profile = getEmotionalVoiceProfile(emotion)
+        return Pair(profile.pitchMultiplier, profile.speedMultiplier)
     }
 
     /**
@@ -454,6 +634,14 @@ class AffyEmotionEngine private constructor() {
         val hasEmoji = Regex("[\\uD83C-\\uDBFF\\uDC00-\\uDFFF\\u2600-\\u27BF]").containsMatchIn(clean)
 
         return when (emotion) {
+            AffyEmotion.SAD_SOFT -> {
+                val textNoExcl = clean.replace("!", ".")
+                if (isSuccess) {
+                    textNoExcl
+                } else {
+                    "Afsos boss... mujhse ye nahi ho saka..."
+                }
+            }
             AffyEmotion.SLIGHTLY_HURT, AffyEmotion.NARAZ_COLD -> {
                 if (isSuccess) {
                     if (clean.endsWith("!")) clean.dropLast(1) + "." else clean

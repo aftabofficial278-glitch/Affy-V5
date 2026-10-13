@@ -45,6 +45,9 @@ class AffyPersonalityEngine {
 
     fun getWaitingPhrase(userSpeech: String): String {
         val emotion = AffyEmotionEngine.getInstance().currentAffyEmotion.value
+        if (emotion == AffyEmotion.SAD_SOFT) {
+            return "Aap fikar na karein... main abhi dekh raha hoon..."
+        }
         if (emotion == AffyEmotion.SLIGHTLY_HURT || emotion == AffyEmotion.NARAZ_COLD) {
             return "Ji boss, abhi kar raha hoon..."
         }
@@ -76,6 +79,9 @@ class AffyPersonalityEngine {
      */
     fun getConversationalReaction(contextTag: String? = null): String {
         val emotion = AffyEmotionEngine.getInstance().currentAffyEmotion.value
+        if (emotion == AffyEmotion.SAD_SOFT) {
+            return listOf("Arey boss... ", "Main samajh sakta hoon... ", "Fikar na karein... ")[(0..2).random()]
+        }
         if (emotion == AffyEmotion.SLIGHTLY_HURT) {
             return "Ji boss, "
         }
